@@ -2,8 +2,9 @@
 // model that follows it -- except on task 2, where it keeps stopping without finishing (to exercise the nudges).
 //   planning block            -> file_tasks (3 tasks, written out in full)
 //   task 1                    -> bash (fix) -> task_note (reports 9000 prompt tokens: opencode compacts) -> finish_task
+//                                (with a summary)
 //   task 2                    -> bash (partial) -> stops with text, every time it is asked
-//   task 3 (after move-on)    -> bash (fix) -> finish_task (its result asks for the final test run)
+//   task 3 (after move-on)    -> bash (fix) -> finish_task with no summary (its result asks for the final test run)
 //   all closed                -> bash (run the checks) -> final text
 export const REQUEST = [
   "There are three separate problems in this project:",
@@ -14,9 +15,9 @@ export const REQUEST = [
 ].join("\n");
 
 export const TASKS = [
-  { title: "Raise the request limit in config.txt", details: "config.txt sets the request limit to 5; it must be 10, and the line must read exactly `limit = 10`. Symptom: requests over 5 fail with \"429 Too Many Requests\".", done_when: "config.txt contains `limit = 10`." },
-  { title: "Make cache entries expire", details: "Entries written to cache.txt never expire and stay forever. They must expire after 60 seconds.", done_when: "An entry older than 60 seconds is no longer returned." },
-  { title: "Add the home page title", details: "page.txt must contain the line `title: Home`. Without it the home page shows \"Untitled\".", done_when: "page.txt contains `title: Home`." },
+  { title: "Raise the request limit in config.txt", details: "config.txt sets the request limit to 5; it must be 10, and the line must read exactly `limit = 10`. Symptom: requests over 5 fail with \"429 Too Many Requests\"." },
+  { title: "Make cache entries expire", details: "Entries written to cache.txt never expire and stay forever. They must expire after 60 seconds." },
+  { title: "Add the home page title", details: "page.txt must contain the line `title: Home`. Without it the home page shows \"Untitled\"." },
 ];
 
 export function textOf(c) {
@@ -47,7 +48,7 @@ export function decide(body, sys) {
   if (cur === "1") {
     if (lastCall === "file_tasks") return call("bash", { command: "printf 'limit = 10\\n' > config.txt && cat config.txt", description: "Set the request limit" });
     if (lastCall === "bash") return call("task_note", { id: 1, text: "Root cause: config.txt had limit = 5. Changed it to limit = 10; cat shows the new line." }, { ptok: 9000 });
-    return call("finish_task", { id: 1, evidence: "cat config.txt prints `limit = 10`." });
+    return call("finish_task", { id: 1, summary: "Set `limit = 10` in config.txt." });
   }
   if (cur === "2") {
     if (lastCall === "finish_task") return call("bash", { command: "printf 'ttl = ?\\n' > cache.txt", description: "Start on cache expiry" });
@@ -55,7 +56,7 @@ export function decide(body, sys) {
   }
   if (cur === "3") {
     if (last.role === "user") return call("bash", { command: "printf 'title: Home\\n' > page.txt && cat page.txt", description: "Add the page title" });
-    if (lastCall === "bash") return call("finish_task", { id: 3, evidence: "cat page.txt prints `title: Home`." });
+    if (lastCall === "bash") return call("finish_task", { id: 3 });
   }
   if (closed) {
     if (lastCall === "finish_task") return call("bash", { command: "grep -q 'limit = 10' config.txt && grep -q 'title: Home' page.txt && echo ALL-CHECKS-PASS", description: "Run the checks" });

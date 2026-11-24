@@ -1,2 +1,8 @@
 node_modules/
 *.tmp
+*.log
+npm-debug.log*
+.DS_Store
+.env
+.env.*
+*.tgz

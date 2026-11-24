@@ -39,6 +39,7 @@ if (!flag("--inside") && !flag("--no-sandbox")) {
 const ALL = ["serve", "run", "probe", "enforce", "enforce-serve"];
 const MODES = (() => { const m = argv.find((a) => [...ALL, "all"].includes(a)) || "all"; return m === "all" ? ALL : [m]; })();
 const isEnforce = (mode) => mode.startsWith("enforce");
+const pluginMode = (mode) => (isEnforce(mode) ? "enforce" : "tasks");
 const viaRun = (mode) => mode === "run" || mode === "enforce";     // the outside driver re-runs `opencode run`
 const OUT = path.resolve(opt("--out", fs.mkdtempSync(path.join(os.tmpdir(), "otd-e2e-"))));
 const OPENCODE = which("opencode") || path.join(os.homedir(), ".opencode/bin/opencode");
@@ -68,7 +69,7 @@ function setup(mode, mockPort) {
     model: "mock/mock-20k",
     compaction: { reserved: 16384 },                   // usable window 20000 - 16384: a 9000-token step overflows
     permission: { read: "allow", edit: "allow", bash: "allow" },
-    plugin: [["file://" + PLUGIN, { dir: stateDir, mode: isEnforce(mode) ? "enforce" : "full", delivery: viaRun(mode) ? "auto" : "prompt" }]],
+    plugin: [["file://" + PLUGIN, { dir: stateDir, mode: pluginMode(mode), delivery: viaRun(mode) ? "auto" : "prompt" }]],
   };
   fs.writeFileSync(path.join(xdg, "config/opencode/opencode.json"), JSON.stringify(cfg, null, 1));
   const env = { ...process.env, XDG_CONFIG_HOME: path.join(xdg, "config"), XDG_DATA_HOME: path.join(xdg, "data"), XDG_STATE_HOME: path.join(xdg, "state"),
@@ -244,13 +245,39 @@ function checks(mode, res, mock, ctx) {
     ["workspace holds only the model's edits", JSON.stringify(gs) === JSON.stringify([" M config.txt", " M page.txt", "?? cache.txt"].sort()), gs.join(", ")],
   ];
   if (mode === "run") c.push(["run turns: request, nudge, nudge, next", JSON.stringify(res.turns.map((t) => t.prompt)) === JSON.stringify(["(the request)", "nudge (task 2)", "nudge (task 2)", "next (task 3)"]), res.turns.map((t) => t.prompt).join(", ")]);
+  c.push(...textChecks(res, mock, st, userTexts));
   return c;
+}
+
+// what the model was shown never asks how a task is checked or verified; the tools take no done_when / evidence
+const ASKS_CHECK = /verif|checked|how to tell|done when|done_when|evidence/i;
+function textChecks(res, mock, st, userTexts) {
+  const agent = mock.log.filter((r) => r.kind === "agent");
+  const blocks = agent.map((r) => r.plugin_block).filter(Boolean);
+  const args = agent.map((r) => r.task_args).find(Boolean) || {};
+  const props = (o) => Object.keys((o && o.properties) || {});
+  const fileItem = args.file_tasks && args.file_tasks.properties.tasks.items;
+  const results = res.messages.flatMap((m) => m.parts).filter((p) => p.type === "tool" && ["file_tasks", "add_task", "task_note", "finish_task", "give_up_task", "list_tasks"].includes(p.tool))
+    .map((p) => String((p.state && (p.state.output || p.state.error)) || ""));
+  const comp = mock.log.filter((r) => r.kind === "compaction").map((r) => r.compaction_text || "");
+  const shown = [...blocks, ...userTexts.slice(1), ...results, ...comp];
+  const bad = shown.filter((t) => ASKS_CHECK.test(t));
+  return [
+    ["tools as opencode sent them: file_tasks items {title, details}, finish_task {id, summary}, add_task {title, details}",
+      JSON.stringify(props(fileItem)) === '["title","details"]' && JSON.stringify(fileItem.required) === '["title","details"]' && JSON.stringify(props(args.finish_task)) === '["id","summary"]' && JSON.stringify(props(args.add_task)) === '["title","details"]',
+      JSON.stringify({ file_tasks_item: props(fileItem), finish_task: props(args.finish_task), add_task: props(args.add_task) })],
+    ["every agent request carried the plugin's block: planning first, then task blocks", agent.every((r) => r.plugin_block) && blocks[0].startsWith("<task_planning>") && blocks.slice(1).every((b) => b.startsWith("<task_list>")), `${blocks.length} blocks over ${agent.length} agent requests`],
+    ["nothing the plugin showed asks how anything was checked (blocks, follow-ups, tool results, compaction prompt)", shown.length > 10 && bad.length === 0, `${shown.length} texts, ${bad.length} matching: ${bad.map((t) => t.slice(0, 120)).join(" | ")}`],
+    ["the nudges use the plain wording", userTexts.slice(1, 3).every((t) => t.endsWith("Continue working on this task. When it is done, call finish_task; if it cannot be done, call give_up_task with the reason.")), userTexts.slice(1, 3).map((t) => t.slice(-90)).join(" | ")],
+    ["state: no done_when; task 1 closed with its summary, task 3 with none; the final pass asked in the tool result", st.mode === "tasks" && st.tasks.every((t) => !("done_when" in t) && !("evidence" in t)) && st.tasks[0].summary === "Set `limit = 10` in config.txt." && st.tasks[2].summary === null && results.some((r) => /^Task 3 marked done\.\n\nAll tasks are closed \(2 done, 1 set aside unfinished\)\.\nAs a last step, run the project's full test suite/.test(r)),
+      JSON.stringify({ mode: st.mode, summaries: st.tasks.map((t) => t.summary), keys: Object.keys(st.tasks[0]) })],
+  ];
 }
 
 let failed = 0;
 for (const mode of MODES) {
   const mockPort = 18080 + MODES.indexOf(mode);
-  const mock = await startMock(mockPort, { scenario: isEnforce(mode) ? "enforce" : "full" });
+  const mock = await startMock(mockPort, { scenario: pluginMode(mode) });
   const ctx = setup(mode, mockPort);
   const t0 = Date.now();
   let res;

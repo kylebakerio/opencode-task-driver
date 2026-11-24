@@ -8,7 +8,7 @@ import path from "node:path";
 
 const IMPLS = { src: "../src/plugin.js", dist: "../dist/opencode-task-driver.js" };
 const SID = "ses_root1";
-const T = (n) => ({ title: `Problem ${n}`, details: `Details ${n}: ERR-${n}`, done_when: `check-${n}` });
+const T = (n) => ({ title: `Problem ${n}`, details: `Details ${n}: ERR-${n}` });
 
 function fakeClient() {
   const sent = [];
@@ -62,17 +62,22 @@ for (const impl of Object.keys(IMPLS)) {
     let { hooks, dir } = await make(impl, { mode: "off" });
     assert.deepEqual(Object.keys(hooks), []);
     assert.equal(events(dir)[0].mode, "off");
-    ({ hooks } = await make(impl, { mode: "full" }, { OPENCODE_TASK_DRIVER: "off" }));
+    ({ hooks } = await make(impl, { mode: "tasks" }, { OPENCODE_TASK_DRIVER: "off" }));
     assert.deepEqual(Object.keys(hooks), []);
     ({ hooks } = await make(impl, { mode: "off" }, { OPENCODE_TASK_DRIVER: "enforce" }));
     assert.equal(hooks.tool, undefined);
     assert.ok(hooks.event);
-    ({ hooks, dir } = await make(impl, { mode: "bogus" }));
-    assert.deepEqual(Object.keys(hooks), []);
-    assert.match(events(dir).at(-1).error, /unknown mode "bogus"/);
+    for (const bad of ["bogus", "todo"]) {
+      ({ hooks, dir } = await make(impl, { mode: bad }));
+      assert.deepEqual(Object.keys(hooks), []);
+      assert.equal(events(dir).at(-1).error, `unknown mode "${bad}"; expected tasks, enforce or off`);
+    }
+    ({ hooks, dir } = await make(impl));
+    assert.equal(events(dir)[0].mode, "tasks", "tasks is the default");
+    assert.ok(hooks.tool);
   });
 
-  test(`[${impl}] full mode: planning block, then a byte-stable task block that changes only at transitions`, async () => {
+  test(`[${impl}] tasks mode: planning block, then a byte-stable task block that changes only at transitions`, async () => {
     const { hooks, dir } = await make(impl);
     assert.deepEqual(Object.keys(hooks.tool).sort(), ["add_task", "file_tasks", "finish_task", "give_up_task", "list_tasks", "task_note"]);
     // every tool's args are plain JSON Schema objects (opencode 1.18's non-zod path)
@@ -93,11 +98,11 @@ for (const impl of Object.keys(IMPLS)) {
     assert.match(b1, /Current task: 1 of 3: Problem 1\n\nDetails 1: ERR-1/);
     await hooks.tool.task_note.execute({ id: 1, text: "cause: off-by-one" }, ctx());
     assert.equal((await request(hooks))[1], b1, "notes do not change the block within a task");
-    const fin = await hooks.tool.finish_task.execute({ id: "1", evidence: "check-1 passed" }, ctx());
+    const fin = await hooks.tool.finish_task.execute({ id: "1", summary: "fixed the off-by-one" }, ctx());
     assert.match(fin, /Next: task 2 of 3: Problem 2/);
     const b2 = (await request(hooks))[1];
     assert.match(b2, /Current task: 2 of 3/);
-    assert.equal(stateOf(dir).tasks[0].evidence, "check-1 passed");
+    assert.equal(stateOf(dir).tasks[0].summary, "fixed the off-by-one");
     const kinds = events(dir).map((e) => e.event);
     assert.ok(kinds.includes("filed") && kinds.includes("noted") && kinds.includes("finished") && kinds.filter((k) => k === "shown").length === 2);
   });
@@ -136,7 +141,7 @@ for (const impl of Object.keys(IMPLS)) {
     await idleCycle(hooks);
     assert.match(client.sent[2].body.parts[0].text, /^Task 1 of 2 \(Problem 1\) is set aside as unfinished\.\n\nNext: task 2 of 2/);
     await userMessage(hooks, client.sent[2].body.parts[0].text);
-    await hooks.tool.finish_task.execute({ id: 2, evidence: "check-2 ok" }, ctx());   // final pass asked in the result
+    await hooks.tool.finish_task.execute({ id: 2, summary: "" }, ctx());   // final pass asked in the result
     await idleCycle(hooks);
     assert.equal(client.sent.length, 3, "final pass was in the tool result: no prompt");
     await idleCycle(hooks);
@@ -225,6 +230,69 @@ for (const impl of Object.keys(IMPLS)) {
     assert.deepEqual(stateOf(dir).todos.map((t) => t.status), ["completed", "pending"]);
   });
 
+  test(`[${impl}] tasks mode: six tools; no done_when or evidence; the env var selects the mode`, async () => {
+    const { hooks, dir } = await make(impl, { mode: "tasks" });
+    assert.equal(events(dir)[0].mode, "tasks");
+    assert.deepEqual(Object.keys(hooks.tool).sort(), ["add_task", "file_tasks", "finish_task", "give_up_task", "list_tasks", "task_note"]);
+    for (const t of Object.values(hooks.tool)) for (const v of Object.values(t.args)) assert.equal(typeof v.type, "string");
+    const item = hooks.tool.file_tasks.args.tasks.items;
+    assert.deepEqual(Object.keys(item.properties), ["title", "details"]);
+    assert.deepEqual(item.required, ["title", "details"]);
+    assert.deepEqual(Object.keys(hooks.tool.add_task.args), ["title", "details"]);
+    assert.deepEqual(Object.keys(hooks.tool.finish_task.args), ["id", "summary"]);
+    assert.equal(hooks.tool.finish_task.description, "Mark a task done. Returns the next task.");
+    assert.equal(hooks.tool.finish_task.args.summary.description, "Optional: a short note of what you changed. May be left empty.");
+    assert.equal(hooks.tool.file_tasks.description, "Split the user's request into separate tasks, one per problem, and keep them in a task list outside the conversation. Call it before starting work when the request contains more than one separate problem. Write each task completely: every detail from the request that matters for it (symptoms, exact error text and quotes, expected behaviour, constraints, where to look), so it can be done from its own text alone. Returns the first task.");
+    const all = JSON.stringify(Object.fromEntries(Object.entries(hooks.tool).map(([k, t]) => [k, { d: t.description, a: t.args }])));
+    assert.doesNotMatch(all, /verif|checked|how to tell|done when|done_when|evidence/i);
+    const viaEnv = await make(impl, { mode: "enforce" }, { OPENCODE_TASK_DRIVER: "tasks" });
+    assert.equal(events(viaEnv.dir)[0].mode, "tasks");
+    assert.deepEqual(Object.keys(viaEnv.hooks.tool.finish_task.args), ["id", "summary"]);
+  });
+
+  test(`[${impl}] tasks mode: planning block, finish without a summary, plain follow-ups, the final pass`, async () => {
+    const { hooks, client, dir } = await make(impl);
+    const sys = await request(hooks);
+    assert.equal(sys.length, 2);
+    assert.match(sys[1], /^<task_planning>\nIf the user's request contains more than one separate problem \(for example several bugs, or several changes that can each be made on their own\)/);
+    assert.doesNotMatch(sys[1], /how to tell|checked/);
+    await userMessage(hooks, "fix three things");
+    const filedOut = await hooks.tool.file_tasks.execute({ tasks: [{ ...T(1), done_when: "check-1" }, T(2), T(3)] }, ctx());   // a done_when sent anyway: dropped
+    assert.doesNotMatch(filedOut, /Done when|check-1/);
+    assert.equal(stateOf(dir).tasks[0].done_when, undefined);
+    const b1 = (await request(hooks))[1];
+    assert.match(b1, /^<task_list>\n[\s\S]*Current task: 1 of 3: Problem 1\n\nDetails 1: ERR-1\n\nNotes recorded for this task: none yet\./);
+    assert.ok(b1.includes("When a task is done, call finish_task with its id; the next task will then be given to you."));
+    assert.doesNotMatch(b1, /verif|checked|Done when/);
+    const fin = await hooks.tool.finish_task.execute({ id: 1 }, ctx());                          // no summary
+    assert.match(fin, /^Task 1 marked done\.\n\nNext: task 2 of 3: Problem 2/);
+    assert.equal(stateOf(dir).tasks[0].status, "done");
+    await hooks.tool.task_note.execute({ id: 2, text: "cache.js sets no TTL" }, ctx());
+    await idleCycle(hooks);
+    assert.equal(client.sent.length, 1);
+    assert.equal(client.sent[0].body.parts[0].text, "Task 2 of 3 (Problem 2) is still open.\n\nDetails 2: ERR-2\n\nNotes recorded for this task:\n- cache.js sets no TTL\n\nContinue working on this task. When it is done, call finish_task; if it cannot be done, call give_up_task with the reason.");
+    await userMessage(hooks, client.sent[0].body.parts[0].text);
+    await hooks.tool.finish_task.execute({ id: 2, summary: "set a 60 s TTL" }, ctx());
+    const out = { context: [] };
+    await hooks["experimental.session.compacting"]({ sessionID: SID }, out);
+    assert.match(out.context[0], /1\. \[done\] Problem 1\n2\. \[done\] Problem 2 \(summary: set a 60 s TTL\)\n   - note: cache\.js sets no TTL\n3\. \[current, open\] Problem 3/);
+    const last = await hooks.tool.finish_task.execute({ id: 3, summary: "" }, ctx());
+    assert.match(last, /^Task 3 marked done\.\n\nAll tasks are closed \(3 done\)\.\nAs a last step, run the project's full test suite/);
+    await idleCycle(hooks);
+    assert.equal(client.sent.length, 1, "the final pass was in the tool result");
+    const s = stateOf(dir);
+    assert.equal(s.mode, "tasks"); assert.equal(s.final_pass, "tool");
+    assert.deepEqual(s.tasks.map((t) => [t.status, t.summary]), [["done", null], ["done", "set a 60 s TTL"], ["done", null]]);
+    // a session whose last task is set aside gets the final pass as a follow-up prompt
+    const b = await make(impl);
+    await b.hooks.tool.file_tasks.execute({ tasks: [T(1)] }, ctx());
+    for (let i = 0; i < 3; i++) { await idleCycle(b.hooks); await userMessage(b.hooks, b.client.sent.at(-1).body.parts[0].text); }
+    assert.equal(b.client.sent.length, 3);
+    assert.match(b.client.sent[2].body.parts[0].text, /^Task 1 of 1 \(Problem 1\) is set aside as unfinished\.\nAll tasks are closed \(0 done, 1 set aside unfinished\)\.\nAs a last step, run the project's full test suite/);
+    await idleCycle(b.hooks);
+    assert.equal(b.client.sent.length, 3);
+  });
+
   test(`[${impl}] dispose writes the state; hooks never throw`, async () => {
     const { hooks, dir } = await make(impl);
     await hooks.tool.file_tasks.execute({ tasks: [T(1)] }, ctx());
@@ -234,6 +302,6 @@ for (const impl of Object.keys(IMPLS)) {
     await hooks["experimental.chat.system.transform"](null, null);
     await hooks["chat.message"](null, null);
     assert.equal(await hooks.tool.list_tasks.execute({}, {}), "Error: no session");
-    assert.match(await hooks.tool.finish_task.execute({ id: 1 }, ctx()), /^Error: say how you verified/);
+    assert.match(await hooks.tool.finish_task.execute({ id: 9 }, ctx()), /^Error: there is no task 9/);
   });
 }

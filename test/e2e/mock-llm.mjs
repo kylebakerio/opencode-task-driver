@@ -6,7 +6,18 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { decide, decideEnforce, textOf } from "./scenario.mjs";
 
-export function startMock(port, { scenario = "full" } = {}) {
+// what the task tools take, as opencode sent them to the model
+const argsOf = (body, name) => { const t = (body.tools || []).find((x) => x.function && x.function.name === name); return t ? t.function.parameters : undefined; };
+// the plugin's own block in the system prompt (opencode's prompt around it says what it says)
+const pluginBlock = (sys) => (sys.match(/<task_(planning|list)>[\s\S]*?<\/task_\1>/) || [null])[0];
+
+// the plugin's part of the summarizer's prompt (its lines have no blank line; opencode's own template is around it)
+const pluginContext = (msgs) => {
+  const t = msgs.map((m) => textOf(m.content)).find((x) => /This session keeps a task list outside the conversation/.test(x));
+  return t ? t.slice(t.indexOf("This session keeps a task list outside the conversation")).split("\n\n")[0] : null;
+};
+
+export function startMock(port, { scenario = "tasks" } = {}) {
   const log = [];
   const server = http.createServer((req, res) => {
     let raw = "";
@@ -33,6 +44,9 @@ export function startMock(port, { scenario = "full" } = {}) {
         task_tools: kind === "agent" ? (body.tools || []).some((t) => t.function && t.function.name === "file_tasks") : undefined,
         todowrite_tool: kind === "agent" ? (body.tools || []).some((t) => t.function && t.function.name === "todowrite") : undefined,
         compaction_has_tasklist: kind === "compaction" ? msgs.some((m) => /keeps a task list outside the conversation/.test(textOf(m.content))) : undefined,
+        compaction_text: kind === "compaction" ? pluginContext(msgs) : undefined,
+        plugin_block: kind === "agent" ? pluginBlock(sysText) : undefined,
+        task_args: kind === "agent" && argsOf(body, "file_tasks") ? { file_tasks: argsOf(body, "file_tasks"), add_task: argsOf(body, "add_task"), finish_task: argsOf(body, "finish_task") } : undefined,
         reply: reply.tool ? { tool: reply.tool, args: reply.args } : { text: reply.text },
       });
       send(res, body, reply, log.length);
@@ -66,6 +80,6 @@ function send(res, body, item, n) {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const port = Number(process.argv[2] || 18080), scenario = process.argv[3] || "full";   // node mock-llm.mjs [port] [full|enforce]
+  const port = Number(process.argv[2] || 18080), scenario = process.argv[3] || "tasks";   // node mock-llm.mjs [port] [tasks|enforce]
   startMock(port, { scenario }).then(() => console.log(`mock (${scenario}) on 127.0.0.1:${port}`));
 }

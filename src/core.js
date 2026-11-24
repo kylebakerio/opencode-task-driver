@@ -4,7 +4,7 @@
 // Every string in this file that starts with a capital letter and ends up in a tool result, the system prompt or a
 // follow-up prompt is visible to the model. Keep it plain workflow language.
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 export const DEFAULTS = Object.freeze({
   maxNudgesPerTask: 2,   // follow-up prompts for one task before it is set aside as unfinished
@@ -16,21 +16,20 @@ export const LIMITS = Object.freeze({
   tasks: 40,             // tasks per session
   title: 200,            // characters
   details: 20000,
-  doneWhen: 4000,
   note: 4000,
   notesPerTask: 50,
-  evidence: 4000,
+  summary: 4000,         // finish_task's summary, give_up_task's reason
 });
 
 // ---------------------------------------------------------------------------------------------------------------
 // state
 
-export function newState(session, mode = "full") {
+export function newState(session, mode = "tasks") {
   return {
     v: 1,
     session,
-    mode,                 // "full" | "enforce"
-    tasks: [],            // {id, title, details, done_when, status, notes[], evidence, reason, nudges, closed_by}
+    mode,                 // "tasks" | "enforce"
+    tasks: [],            // {id, title, details, status, notes[], summary, reason, nudges, closed_by}
     prompts: 0,           // follow-up prompts decided so far (each counts once, delivered or not)
     final_pass: null,     // null | "tool" (asked in a finish/give-up result) | "prompt" (asked as a follow-up prompt)
     pending: null,        // the follow-up prompt decided at the last idle and not yet seen as a user message
@@ -45,6 +44,11 @@ export function newState(session, mode = "full") {
 }
 
 const STATUS_LABEL = { open: "open", done: "done", given_up: "given up", unfinished: "set aside: unfinished" };
+
+// THE MODES. "tasks" (the default) drives a task list the model files: the planning block, the list outside the
+// conversation, one task at a time, follow-ups, the closing full test run. "enforce" follows the model's own todo list
+// instead.
+export function drivesTasks(mode) { return mode === "tasks"; }
 
 export function currentTask(state) {
   return state.tasks.find((t) => t.status === "open") || null;
@@ -73,25 +77,27 @@ function clip(s, n) {
 // ---------------------------------------------------------------------------------------------------------------
 // input normalization (tool arguments arrive unvalidated: local models send strings for arrays and numbers)
 
+// A task is {title, details}; any other field the model sends is dropped.
 export function normalizeTask(raw, where = "task") {
+  const shape = "title and details";
   if (typeof raw === "string") {
-    try { raw = JSON.parse(raw); } catch { return { error: `${where} must be an object with title, details and done_when` }; }
+    try { raw = JSON.parse(raw); } catch { return { error: `${where} must be an object with ${shape}` }; }
   }
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: `${where} must be an object with title, details and done_when` };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: `${where} must be an object with ${shape}` };
   const title = clip(raw.title, LIMITS.title);
   const details = clip(raw.details ?? raw.description, LIMITS.details);
-  const done_when = clip(raw.done_when ?? raw.doneWhen ?? raw.done, LIMITS.doneWhen);
   if (!title) return { error: `${where} has no title` };
   if (!details) return { error: `${where} ("${title}") has no details: write out everything from the request that matters for it` };
-  return { task: { title, details, done_when } };
+  return { task: { title, details } };
 }
 
 export function normalizeTasks(raw) {
+  const shape = "{title, details}";
   if (typeof raw === "string") {
-    try { raw = JSON.parse(raw); } catch { return { error: "tasks must be a list of {title, details, done_when} objects" }; }
+    try { raw = JSON.parse(raw); } catch { return { error: `tasks must be a list of ${shape} objects` }; }
   }
   if (raw && !Array.isArray(raw) && typeof raw === "object" && Array.isArray(raw.tasks)) raw = raw.tasks;
-  if (!Array.isArray(raw) || raw.length === 0) return { error: "tasks must be a non-empty list of {title, details, done_when} objects" };
+  if (!Array.isArray(raw) || raw.length === 0) return { error: `tasks must be a non-empty list of ${shape} objects` };
   if (raw.length > LIMITS.tasks) return { error: `at most ${LIMITS.tasks} tasks can be filed` };
   const out = [];
   for (let i = 0; i < raw.length; i++) {
@@ -105,10 +111,9 @@ export function normalizeTasks(raw) {
 // ---------------------------------------------------------------------------------------------------------------
 // rendering
 
-// "<head> <id> of <N>: <title>" + the task's full text (details, done when, notes)
+// "<head> <id> of <N>: <title>" + the task's full text (details, notes)
 function taskText(state, t, head = "Task", { notes = true } = {}) {
   const lines = [`${head} ${t.id} of ${state.tasks.length}: ${t.title}`, "", t.details];
-  if (t.done_when) lines.push("", `Done when: ${t.done_when}`);
   if (notes && t.notes.length) {
     lines.push("", "Notes recorded for this task:");
     for (const n of t.notes) lines.push(`- ${n.text}`);
@@ -124,13 +129,14 @@ function listLines(state, { mark = true } = {}) {
   });
 }
 
-const WORK_RULES = "When a task is done and you have checked it, call finish_task with its id and how you verified it; the next task will then be given to you. If a task cannot be done, call give_up_task with its id and the reason.";
+const WORK_RULES = "When a task is done, call finish_task with its id; the next task will then be given to you. If a task cannot be done, call give_up_task with its id and the reason.";
+const CONTINUE = "Continue working on this task. When it is done, call finish_task; if it cannot be done, call give_up_task with the reason.";
 const TOOLS_HELP = "Use task_note to record findings and progress for a task (notes are kept even if the conversation is summarized), add_task if you find another separate problem, and list_tasks to see the whole list.";
 
 export const PLANNING_BLOCK = [
   "<task_planning>",
-  "If the user's request contains more than one separate problem (for example several bugs, or several changes that can each be made and checked on their own), call the file_tasks tool before you start working, with one task per problem.",
-  "Write each task out completely and losslessly: put every detail from the request that matters for that problem into the task (symptoms, exact error messages and quoted text, expected behaviour, constraints, names of files, functions or features and where to look, and how to tell it is done), so that the task can be done later from its own text without re-reading the request. Do not shorten or summarize details away; when unsure whether a detail matters, include it.",
+  "If the user's request contains more than one separate problem (for example several bugs, or several changes that can each be made on their own), call the file_tasks tool before you start working, with one task per problem.",
+  "Write each task out completely and losslessly: put every detail from the request that matters for that problem into the task (symptoms, exact error messages and quoted text, expected behaviour, constraints, names of files, functions or features and where to look), so that the task can be done later from its own text without re-reading the request. Do not shorten or summarize details away; when unsure whether a detail matters, include it.",
   "After filing, work on the tasks one at a time, in order.",
   "If the request is a single problem, do not call file_tasks; just do the work.",
   "</task_planning>",
@@ -160,10 +166,10 @@ export function renderTaskBlock(state) {
   return out.join("\n");
 }
 
-// The block for this request. full mode: the planning instructions until tasks are filed, then the task block,
+// The block for this request. tasks mode: the planning instructions until tasks are filed, then the task block,
 // re-rendered only when viewKey changes. enforce mode: nothing. Mutates state.view (the caller saves it).
 export function systemBlock(state) {
-  if (state.mode !== "full") return null;
+  if (!drivesTasks(state.mode)) return null;
   if (!state.tasks.length) return PLANNING_BLOCK;
   const key = viewKey(state);
   if (!state.view || state.view.key !== key) state.view = { key, text: renderTaskBlock(state) };
@@ -171,14 +177,14 @@ export function systemBlock(state) {
 }
 
 export function compactionContext(state) {
-  if (state.mode !== "full" || !state.tasks.length) return null;
+  if (!drivesTasks(state.mode) || !state.tasks.length) return null;
   const cur = currentTask(state);
   const lines = [
     "This session keeps a task list outside the conversation; it is shown to the assistant again after this summary, so the summary does not need to repeat the task texts. Keep in the summary, for each task, its number, title and status, what was found and changed for it, and what is left to do for the open ones. The task list as it stands:",
   ];
   for (const t of state.tasks) {
     let s = `${t.id}. [${cur && t.id === cur.id ? "current, open" : STATUS_LABEL[t.status]}] ${t.title}`;
-    if (t.status === "done" && t.evidence) s += ` (verified: ${clip(t.evidence, 300)})`;
+    if (t.status === "done" && t.summary) s += ` (summary: ${clip(t.summary, 300)})`;
     if (t.status === "given_up" && t.reason) s += ` (reason: ${clip(t.reason, 300)})`;
     lines.push(s);
     for (const n of t.notes) lines.push(`   - note: ${clip(n.text, 500)}`);
@@ -198,7 +204,7 @@ function finalPassText(state) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// tools (full mode). Each returns {output, event}; output is the tool result the model reads.
+// tools (tasks mode). Each returns {output, event}; output is the tool result the model reads.
 
 function err(msg) { return { output: `Error: ${msg}`, event: { event: "tool-error", error: msg } }; }
 
@@ -212,11 +218,15 @@ function nextAfterClose(state, opts) {
   return "All tasks are closed.";
 }
 
+function newTask(id, t) {
+  return { id, ...t, status: "open", notes: [], summary: null, reason: null, nudges: 0, closed_by: null };
+}
+
 export function fileTasks(state, rawTasks) {
   if (state.tasks.length) return err(`${state.tasks.length} tasks are already filed; use add_task to add another one, or list_tasks to see them`);
   const r = normalizeTasks(rawTasks);
   if (r.error) return err(r.error);
-  state.tasks = r.tasks.map((t, i) => ({ id: i + 1, ...t, status: "open", notes: [], evidence: null, reason: null, nudges: 0, closed_by: null }));
+  state.tasks = r.tasks.map((t, i) => newTask(i + 1, t));
   const cur = currentTask(state);
   const out = [
     `Filed ${state.tasks.length} task${state.tasks.length === 1 ? "" : "s"}:`,
@@ -231,9 +241,9 @@ export function fileTasks(state, rawTasks) {
 
 export function addTask(state, raw) {
   if (state.tasks.length >= LIMITS.tasks) return err(`at most ${LIMITS.tasks} tasks can be filed`);
-  const r = normalizeTask(raw);
+  const r = normalizeTask(raw, "task");
   if (r.error) return err(r.error);
-  const t = { id: state.tasks.length + 1, ...r.task, status: "open", notes: [], evidence: null, reason: null, nudges: 0, closed_by: null };
+  const t = newTask(state.tasks.length + 1, r.task);
   state.tasks.push(t);
   const cur = currentTask(state);
   const tail = cur && cur.id !== t.id ? ` The current task is still task ${cur.id} (${cur.title}).` : (cur ? ` It is now the current task.` : "");
@@ -254,14 +264,14 @@ export function taskNote(state, id, text) {
   };
 }
 
-export function finishTask(state, id, evidence, opts = DEFAULTS) {
+// `note`: an optional short summary of what changed.
+export function finishTask(state, id, note, opts = DEFAULTS) {
   if (!state.tasks.length) return err("no tasks are filed in this session");
   const t = taskById(state, id);
   if (!t) return err(`there is no task ${JSON.stringify(id)}; tasks are numbered 1 to ${state.tasks.length}`);
   if (t.status !== "open") return err(`task ${t.id} is already closed (${STATUS_LABEL[t.status]})`);
-  const ev = clip(evidence, LIMITS.evidence);
-  if (!ev) return err("say how you verified that the task is done (for example which test or command you ran and what it showed)");
-  t.status = "done"; t.evidence = ev; t.closed_by = "model";
+  t.summary = clip(note, LIMITS.summary) || null;
+  t.status = "done"; t.closed_by = "model";
   return { output: `Task ${t.id} marked done.\n\n${nextAfterClose(state, opts)}`, event: { event: "finished", id: t.id } };
 }
 
@@ -270,7 +280,7 @@ export function giveUpTask(state, id, reason, opts = DEFAULTS) {
   const t = taskById(state, id);
   if (!t) return err(`there is no task ${JSON.stringify(id)}; tasks are numbered 1 to ${state.tasks.length}`);
   if (t.status !== "open") return err(`task ${t.id} is already closed (${STATUS_LABEL[t.status]})`);
-  const r = clip(reason, LIMITS.evidence);
+  const r = clip(reason, LIMITS.summary);
   if (!r) return err("give the reason the task cannot be done");
   t.status = "given_up"; t.reason = r; t.closed_by = "model";
   return { output: `Task ${t.id} marked as given up.\n\n${nextAfterClose(state, opts)}`, event: { event: "gave-up", id: t.id } };
@@ -296,7 +306,7 @@ function capReached(state, opts) {
   return false;
 }
 
-export function decideFull(state, opts = DEFAULTS) {
+export function decideTasks(state, opts = DEFAULTS) {
   opts = { ...DEFAULTS, ...opts };
   if (!state.tasks.length) return null;                               // nothing filed: single-problem behaviour
   if (state.final_pass === "prompt" && !currentTask(state)) return null;   // closing request already sent
@@ -305,9 +315,8 @@ export function decideFull(state, opts = DEFAULTS) {
   if (cur && cur.nudges < opts.maxNudgesPerTask) {
     cur.nudges += 1; state.prompts += 1;
     const text = `Task ${cur.id} of ${state.tasks.length} (${cur.title}) is still open.\n\n${cur.details}` +
-      (cur.done_when ? `\n\nDone when: ${cur.done_when}` : "") +
       (cur.notes.length ? `\n\nNotes recorded for this task:\n${cur.notes.map((n) => `- ${n.text}`).join("\n")}` : "") +
-      `\n\nContinue working on this task. When it is done and checked, call finish_task with how you verified it; if it cannot be done, call give_up_task with the reason.`;
+      `\n\n${CONTINUE}`;
     return { kind: "nudge", task: cur.id, n: cur.nudges, text };
   }
   let setAside = null;
@@ -347,7 +356,7 @@ export function decideEnforce(state, opts = DEFAULTS) {
 }
 
 export function decide(state, opts) {
-  return state.mode === "enforce" ? decideEnforce(state, opts) : decideFull(state, opts);
+  return state.mode === "enforce" ? decideEnforce(state, opts) : decideTasks(state, opts);
 }
 
 // `opencode run "<text>"` sends a message argument that contains a space as "<text>" with each " escaped as \"

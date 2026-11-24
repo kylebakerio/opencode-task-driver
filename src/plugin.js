@@ -3,6 +3,7 @@
 //
 // Hooks used:
 //   tool                                   file_tasks, add_task, task_note, finish_task, give_up_task, list_tasks
+//                                          (tasks mode)
 //   event                                  session.status / session.idle (follow-ups), session.error and assistant
 //                                          errors (no follow-up after a failure or an abort), session.created
 //                                          (sub-agent sessions are left alone), session.compacted, todo.updated
@@ -19,9 +20,9 @@ import * as core from "./core.js";
 const TITLE_PROMPT = "You are a title generator";   // opencode's title agent; its requests get nothing from us
 
 function resolveMode(options) {
-  const raw = String(process.env.OPENCODE_TASK_DRIVER || (options && options.mode) || "full").trim().toLowerCase();
+  const raw = String(process.env.OPENCODE_TASK_DRIVER || (options && options.mode) || "tasks").trim().toLowerCase();
   if (["off", "0", "false", "no", "none"].includes(raw)) return "off";
-  return raw === "full" || raw === "enforce" ? raw : { invalid: raw };
+  return raw === "tasks" || raw === "enforce" ? raw : { invalid: raw };
 }
 
 // "prompt": the plugin sends follow-ups itself (TUI, `opencode serve`, `opencode run --attach` servers).
@@ -54,7 +55,7 @@ export const TaskDriver = async (input, options = {}) => {
   };
   const mode = resolveMode(options);
   if (mode === "off") { log({ event: "loaded", mode: "off", version: core.VERSION }); return {}; }
-  if (typeof mode === "object") { log({ event: "error", error: `unknown mode ${JSON.stringify(mode.invalid)}; expected full, enforce or off` }); return {}; }
+  if (typeof mode === "object") { log({ event: "error", error: `unknown mode ${JSON.stringify(mode.invalid)}; expected tasks, enforce or off` }); return {}; }
   const delivery = resolveDelivery(options);
   const opts = {
     maxNudgesPerTask: Number.isInteger(options.maxNudgesPerTask) ? options.maxNudgesPerTask : core.DEFAULTS.maxNudgesPerTask,
@@ -129,7 +130,7 @@ export const TaskDriver = async (input, options = {}) => {
       return;
     }
     const s = peek(sid);
-    if (!s) return;                       // nothing filed (full) / no todo list seen (enforce): inert
+    if (!s) return;                       // nothing filed (tasks) / no todo list seen (enforce): inert
     if (s.pending) { log({ event: "pending-dropped", session: sid, kind: s.pending.kind }); s.pending = null; }
     const before = s.stopped;
     const act = core.decide(s, opts);
@@ -220,7 +221,7 @@ export const TaskDriver = async (input, options = {}) => {
 
     "experimental.chat.system.transform": async (inp, out) => guard("system.transform", () => {
       const sid = inp && inp.sessionID;
-      if (!sid || mode !== "full" || !out || !Array.isArray(out.system)) return;
+      if (!sid || !core.drivesTasks(mode) || !out || !Array.isArray(out.system)) return;
       if (typeof out.system[0] === "string" && out.system[0].startsWith(TITLE_PROMPT)) return;
       if (!mainStep.has(sid)) return;
       mainStep.delete(sid);
@@ -240,7 +241,7 @@ export const TaskDriver = async (input, options = {}) => {
       const sid = inp && inp.sessionID;
       if (!sid) return;
       compactingNow.add(sid);
-      if (mode !== "full") return;
+      if (!core.drivesTasks(mode)) return;
       const s = peek(sid);
       const ctx = s && core.compactionContext(s);
       if (ctx && out && Array.isArray(out.context)) { out.context.push(ctx); log({ event: "compaction-context", session: sid, tasks: s.tasks.length }); }
@@ -252,12 +253,14 @@ export const TaskDriver = async (input, options = {}) => {
     }),
   };
 
-  if (mode === "full") hooks.tool = tools({ stateFor, save, log, opts });
+  if (core.drivesTasks(mode)) hooks.tool = tools({ stateFor, save, log, opts });
   return hooks;
 };
 
-// Tool argument schemas are plain JSON Schema: opencode 1.18 accepts them for plugin tools (every listed property
-// is required and nothing is validated, so core.js validates). No zod import keeps this a single dependency-free file.
+// Tool argument schemas are plain JSON Schema: opencode 1.18 accepts them for plugin tools (every listed top-level
+// property is required and nothing is validated, so core.js validates). No zod import keeps this a single
+// dependency-free file. finish_task's summary may be empty (listed, so opencode shows it as required; core.js accepts
+// it empty or missing).
 function tools({ stateFor, save, log, opts }) {
   const run = (ctx, fn) => {
     const sid = ctx && ctx.sessionID;
@@ -271,22 +274,22 @@ function tools({ stateFor, save, log, opts }) {
   };
   const str = (description) => ({ type: "string", description });
   const id = { type: "integer", description: "The task's number in the task list." };
+  const item = {
+    type: "object",
+    properties: {
+      title: str("A short name for the problem."),
+      details: str("Everything from the request that matters for this problem, written out in full: symptoms, exact error messages and quoted text, expected behaviour, constraints, where to look."),
+    },
+    required: ["title", "details"],
+  };
   return {
     file_tasks: {
-      description: "Split the user's request into separate tasks, one per problem, and keep them in a task list outside the conversation. Call it before starting work when the request contains more than one separate problem. Write each task completely: every detail from the request that matters for it (symptoms, exact error text and quotes, expected behaviour, constraints, where to look, how to tell it is done), so it can be done from its own text alone. Returns the first task.",
+      description: "Split the user's request into separate tasks, one per problem, and keep them in a task list outside the conversation. Call it before starting work when the request contains more than one separate problem. Write each task completely: every detail from the request that matters for it (symptoms, exact error text and quotes, expected behaviour, constraints, where to look), so it can be done from its own text alone. Returns the first task.",
       args: {
         tasks: {
           type: "array",
           description: "One entry per separate problem, in the order to work on them.",
-          items: {
-            type: "object",
-            properties: {
-              title: str("A short name for the problem."),
-              details: str("Everything from the request that matters for this problem, written out in full: symptoms, exact error messages and quoted text, expected behaviour, constraints, where to look."),
-              done_when: str("How to tell this problem is solved (what to run or check, and what it should show)."),
-            },
-            required: ["title", "details", "done_when"],
-          },
+          items: item,
         },
       },
       execute: async (args, ctx) => run(ctx, (s) => core.fileTasks(s, args && args.tasks)),
@@ -296,7 +299,6 @@ function tools({ stateFor, save, log, opts }) {
       args: {
         title: str("A short name for the problem."),
         details: str("Everything that matters for this problem, written out in full."),
-        done_when: str("How to tell this problem is solved."),
       },
       execute: async (args, ctx) => run(ctx, (s) => core.addTask(s, args)),
     },
@@ -306,9 +308,9 @@ function tools({ stateFor, save, log, opts }) {
       execute: async (args, ctx) => run(ctx, (s) => core.taskNote(s, args && args.id, args && args.text)),
     },
     finish_task: {
-      description: "Mark a task done, after you have checked that it works. Returns the next task.",
-      args: { id, evidence: str("How you verified it: for example the test or command you ran and what it showed.") },
-      execute: async (args, ctx) => run(ctx, (s) => core.finishTask(s, args && args.id, args && args.evidence, opts)),
+      description: "Mark a task done. Returns the next task.",
+      args: { id, summary: str("Optional: a short note of what you changed. May be left empty.") },
+      execute: async (args, ctx) => run(ctx, (s) => core.finishTask(s, args && args.id, args && args.summary, opts)),
     },
     give_up_task: {
       description: "Mark a task as one that cannot be done, with the reason. Returns the next task.",

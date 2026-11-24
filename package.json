@@ -1,8 +1,17 @@
 {
   "name": "opencode-task-driver",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "opencode plugin: split a multi-problem request into tasks and work them one at a time",
   "private": true,
+  "author": "Kyle Baker",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kylebakerio/opencode-task-driver.git"
+  },
+  "homepage": "https://github.com/kylebakerio/opencode-task-driver#readme",
+  "bugs": {
+    "url": "https://github.com/kylebakerio/opencode-task-driver/issues"
+  },
   "type": "module",
   "main": "dist/opencode-task-driver.js",
   "exports": {
@@ -24,7 +33,10 @@
   },
   "keywords": [
     "opencode",
-    "opencode-plugin"
+    "opencode-plugin",
+    "agent",
+    "task-list",
+    "coding-agent"
   ],
   "license": "MIT"
 }
