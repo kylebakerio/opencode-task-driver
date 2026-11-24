@@ -5,6 +5,10 @@
 //
 //   node test/e2e/e2e.mjs [serve|run|probe|enforce|enforce-serve|all] [--out DIR] [--no-sandbox]
 //
+//   The mock model is STRICT about system messages, like chat templates that take one leading system message (Qwen3.8
+//   Flash-Next on llama.cpp --jinja): a request whose system message is not the first message gets HTTP 500, and every
+//   mode must finish with none rejected (0.2.1: the plugin's block is appended to opencode's system prompt).
+//
 //   serve: `opencode serve` + HTTP, plugin delivery "prompt" (the plugin sends its follow-ups itself)
 //   run:   `opencode run` turns, plugin delivery "auto" (= "file" inside `opencode run`); this script is the outside
 //          driver: after each turn it reads the pending follow-up from the state file and runs
@@ -277,7 +281,7 @@ function textChecks(res, mock, st, userTexts) {
 let failed = 0;
 for (const mode of MODES) {
   const mockPort = 18080 + MODES.indexOf(mode);
-  const mock = await startMock(mockPort, { scenario: pluginMode(mode) });
+  const mock = await startMock(mockPort, { scenario: pluginMode(mode), strict: true });
   const ctx = setup(mode, mockPort);
   const t0 = Date.now();
   let res;
@@ -286,8 +290,12 @@ for (const mode of MODES) {
   mock.server.close();
   fs.writeFileSync(path.join(ctx.dir, "transcript.md"), `# ${mode} transcript (session ${res.session})\n\n` + render(res.messages));
   fs.writeFileSync(path.join(ctx.dir, "mock-log.json"), JSON.stringify(mock.log, null, 1));
-  const c = mode === "probe" ? probeChecks(res, mock, ctx) : isEnforce(mode) ? enforceChecks(mode, res, mock, ctx) : checks(mode, res, mock, ctx);
-  console.log(`\n== ${mode}: ${((Date.now() - t0) / 1000).toFixed(1)} s, ${mock.log.length} model requests, transcript ${path.join(ctx.dir, "transcript.md")}`);
+  let c;
+  try { c = mode === "probe" ? probeChecks(res, mock, ctx) : isEnforce(mode) ? enforceChecks(mode, res, mock, ctx) : checks(mode, res, mock, ctx); }
+  catch (e) { c = [["the checks could run (the session went far enough to check)", false, String(e && e.message || e).slice(0, 300)]]; }
+  const rejected = mock.log.filter((r) => r.kind === "rejected").length;
+  c.push(["the strict mock rejected no request (one leading system message only)", rejected === 0, `${rejected} rejected`]);
+  console.log(`\n== ${mode}: ${((Date.now() - t0) / 1000).toFixed(1)} s, ${mock.log.length} model requests, ${rejected} rejected by the strict mock, transcript ${path.join(ctx.dir, "transcript.md")}`);
   for (const [name, ok, detail] of c) { console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : "\n        got: " + detail}`); if (!ok) failed++; }
 }
 console.log(failed ? `\n${failed} check(s) failed` : "\nall checks passed");

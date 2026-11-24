@@ -9,7 +9,8 @@
 //                                          (sub-agent sessions are left alone), session.compacted, todo.updated
 //   chat.message                           a follow-up arrived (delivered) or the user said something else
 //   experimental.chat.messages.transform   marks "the next system prompt is a main-agent request"
-//   experimental.chat.system.transform     the planning instructions / the task block
+//   experimental.chat.system.transform     the planning instructions / the task block, appended to opencode's system
+//                                          prompt (one system message)
 //   experimental.session.compacting        the task list goes into the summarizer's prompt
 //   dispose                                last state write
 import fs from "node:fs";
@@ -230,7 +231,12 @@ export const TaskDriver = async (input, options = {}) => {
       const key = s.view && s.view.key;
       const block = core.systemBlock(s);
       if (!block) return;
-      out.system.push(block);
+      // INTO the system prompt (0.2.1): opencode sends each element of this array as its own system message, and some
+      // chat templates take only one leading system message (Qwen3.8 Flash-Next on llama.cpp --jinja: "System message must
+      // be at the beginning"); such a request fails and opencode retries the step without the block.
+      const last = out.system.length - 1;
+      if (last >= 0 && typeof out.system[last] === "string") out.system[last] = `${out.system[last]}\n\n${block}`;
+      else out.system.push(block);
       if (s.tasks.length && s.view.key !== key) {
         save(sid);
         log({ event: "shown", session: sid, key: s.view.key, chars: block.length });

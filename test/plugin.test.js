@@ -44,6 +44,12 @@ async function request(hooks, sid = SID, base = "You are opencode, an interactiv
   await hooks["experimental.chat.system.transform"]({ sessionID: sid, model: {} }, out);
   return out.system;
 }
+// the plugin's block in a request's system prompt (0.2.1: appended to opencode's prompt, one element), or null
+const BASE = "You are opencode, an interactive CLI tool.";
+function blockOf(sys) {
+  if (!Array.isArray(sys) || sys.length !== 1 || !sys[0].startsWith(BASE + "\n\n")) return null;
+  return sys[0].slice(BASE.length + 2);
+}
 // a cycle ending normally: busy ... assistant completed ... busy, idle, session.idle
 async function idleCycle(hooks, sid = SID, { error } = {}) {
   await hooks.event(ev("session.status", { sessionID: sid, status: { type: "busy" } }));
@@ -83,24 +89,24 @@ for (const impl of Object.keys(IMPLS)) {
     // every tool's args are plain JSON Schema objects (opencode 1.18's non-zod path)
     for (const t of Object.values(hooks.tool)) for (const v of Object.values(t.args)) assert.equal(typeof v.type, "string");
     let sys = await request(hooks);
-    assert.equal(sys.length, 2); assert.match(sys[1], /^<task_planning>/);
+    assert.equal(sys.length, 1); assert.match(blockOf(sys), /^<task_planning>/);
     assert.equal(fs.existsSync(path.join(dir, SID + ".json")), false, "nothing stored before anything is filed");
     // no main-step mark (e.g. a forked title request) -> nothing
     const bare = { system: ["You are opencode"] };
     await hooks["experimental.chat.system.transform"]({ sessionID: SID, model: {} }, bare);
-    assert.equal(bare.system.length, 1);
+    assert.deepEqual(bare.system, ["You are opencode"]);
     // the title agent never gets it, even when marked
     sys = await request(hooks, SID, "You are a title generator. You output ONLY a thread title.");
-    assert.equal(sys.length, 1);
+    assert.deepEqual(sys, ["You are a title generator. You output ONLY a thread title."]);
     const out = await hooks.tool.file_tasks.execute({ tasks: JSON.stringify([T(1), T(2), T(3)]) }, ctx());
     assert.match(out, /Filed 3 tasks/);
-    const b1 = (await request(hooks))[1];
+    const b1 = blockOf(await request(hooks));
     assert.match(b1, /Current task: 1 of 3: Problem 1\n\nDetails 1: ERR-1/);
     await hooks.tool.task_note.execute({ id: 1, text: "cause: off-by-one" }, ctx());
-    assert.equal((await request(hooks))[1], b1, "notes do not change the block within a task");
+    assert.equal(blockOf(await request(hooks)), b1, "notes do not change the block within a task");
     const fin = await hooks.tool.finish_task.execute({ id: "1", summary: "fixed the off-by-one" }, ctx());
     assert.match(fin, /Next: task 2 of 3: Problem 2/);
-    const b2 = (await request(hooks))[1];
+    const b2 = blockOf(await request(hooks));
     assert.match(b2, /Current task: 2 of 3/);
     assert.equal(stateOf(dir).tasks[0].summary, "fixed the off-by-one");
     const kinds = events(dir).map((e) => e.event);
@@ -110,15 +116,15 @@ for (const impl of Object.keys(IMPLS)) {
   test(`[${impl}] compaction: the list goes into the summarizer's prompt, not its system; the block refreshes after`, async () => {
     const { hooks, dir } = await make(impl);
     await hooks.tool.file_tasks.execute({ tasks: [T(1), T(2)] }, ctx());
-    const b1 = (await request(hooks))[1];
+    const b1 = blockOf(await request(hooks));
     await hooks.tool.task_note.execute({ id: 1, text: "NOTE-AFTER-SNAPSHOT" }, ctx());
     const out = { context: [], prompt: undefined };
     await hooks["experimental.session.compacting"]({ sessionID: SID }, out);
     assert.equal(out.context.length, 1);
     assert.match(out.context[0], /1\. \[current, open\] Problem 1\n   - note: NOTE-AFTER-SNAPSHOT\n2\. \[open\] Problem 2/);
-    assert.equal((await request(hooks)).length, 1, "the summarizer's own request gets no block");
+    assert.deepEqual(await request(hooks), [BASE], "the summarizer's own request gets no block");
     await hooks.event(ev("session.compacted", { sessionID: SID }));
-    const b2 = (await request(hooks))[1];
+    const b2 = blockOf(await request(hooks));
     assert.notEqual(b2, b1);
     assert.match(b2, /Notes recorded for this task:\n- NOTE-AFTER-SNAPSHOT/);
     assert.equal(stateOf(dir).compactions, 1);
@@ -167,7 +173,7 @@ for (const impl of Object.keys(IMPLS)) {
     const CHILD = "ses_child";
     await hooks.event(ev("session.created", { info: { id: CHILD, parentID: SID } }));
     await hooks.tool.file_tasks.execute({ tasks: [T(1)] }, ctx(CHILD));
-    assert.equal((await request(hooks, CHILD)).length, 1, "no block for a sub-agent");
+    assert.deepEqual(await request(hooks, CHILD), [BASE], "no block for a sub-agent");
     await idleCycle(hooks, CHILD);
     assert.equal(client.sent.length, 1, "no follow-up for a sub-agent");
   });
@@ -215,7 +221,7 @@ for (const impl of Object.keys(IMPLS)) {
   test(`[${impl}] enforce mode: no tools, no injection; nudges from the mirrored todo list`, async () => {
     const { hooks, client, dir } = await make(impl, { mode: "enforce" });
     assert.equal(hooks.tool, undefined);
-    assert.equal((await request(hooks)).length, 1);
+    assert.deepEqual(await request(hooks), [BASE]);
     await idleCycle(hooks);
     assert.equal(client.sent.length, 0, "no todo list: inert");
     await hooks.event(ev("todo.updated", { sessionID: SID, todos: [{ id: "1", content: "fix A", status: "completed", priority: "high" }, { id: "2", content: "fix B", status: "pending", priority: "high" }] }));
@@ -253,14 +259,14 @@ for (const impl of Object.keys(IMPLS)) {
   test(`[${impl}] tasks mode: planning block, finish without a summary, plain follow-ups, the final pass`, async () => {
     const { hooks, client, dir } = await make(impl);
     const sys = await request(hooks);
-    assert.equal(sys.length, 2);
-    assert.match(sys[1], /^<task_planning>\nIf the user's request contains more than one separate problem \(for example several bugs, or several changes that can each be made on their own\)/);
-    assert.doesNotMatch(sys[1], /how to tell|checked/);
+    assert.equal(sys.length, 1);
+    assert.match(blockOf(sys), /^<task_planning>\nIf the user's request contains more than one separate problem \(for example several bugs, or several changes that can each be made on their own\)/);
+    assert.doesNotMatch(blockOf(sys), /how to tell|checked/);
     await userMessage(hooks, "fix three things");
     const filedOut = await hooks.tool.file_tasks.execute({ tasks: [{ ...T(1), done_when: "check-1" }, T(2), T(3)] }, ctx());   // a done_when sent anyway: dropped
     assert.doesNotMatch(filedOut, /Done when|check-1/);
     assert.equal(stateOf(dir).tasks[0].done_when, undefined);
-    const b1 = (await request(hooks))[1];
+    const b1 = blockOf(await request(hooks));
     assert.match(b1, /^<task_list>\n[\s\S]*Current task: 1 of 3: Problem 1\n\nDetails 1: ERR-1\n\nNotes recorded for this task: none yet\./);
     assert.ok(b1.includes("When a task is done, call finish_task with its id; the next task will then be given to you."));
     assert.doesNotMatch(b1, /verif|checked|Done when/);
@@ -303,5 +309,31 @@ for (const impl of Object.keys(IMPLS)) {
     await hooks["chat.message"](null, null);
     assert.equal(await hooks.tool.list_tasks.execute({}, {}), "Error: no session");
     assert.match(await hooks.tool.finish_task.execute({ id: 9 }, ctx()), /^Error: there is no task 9/);
+  });
+}
+
+// 0.2.1: opencode sends each element of the system array as its own system message, and some chat templates take only
+// one leading system message (Qwen3.8 Flash-Next on llama.cpp --jinja: "System message must be at the beginning"); the
+// request then fails and opencode retries it without the plugin's block. The block is appended to the system prompt.
+for (const impl of Object.keys(IMPLS)) {
+  test(`[${impl}] the block is appended to the system prompt: one element in, one element out, byte-stable within a task`, async () => {
+    const { hooks } = await make(impl);
+    const BASE = "You are opencode, an interactive CLI tool.";
+    let sys = await request(hooks);
+    assert.equal(sys.length, 1);
+    assert.ok(sys[0].startsWith(BASE + "\n\n<task_planning>\n") && sys[0].endsWith("</task_planning>"), sys[0].slice(0, 80));
+    await hooks.tool.file_tasks.execute({ tasks: [T(1), T(2)] }, ctx());
+    const a = await request(hooks), b = await request(hooks);
+    assert.equal(a.length, 1);
+    assert.ok(a[0].startsWith(BASE + "\n\n<task_list>\n") && a[0].endsWith("</task_list>"));
+    assert.equal(a[0], b[0], "byte-stable within a task");
+    // an empty system array: the block is its only element
+    await hooks["experimental.chat.messages.transform"]({}, { messages: [{ info: { sessionID: SID, role: "user" }, parts: [] }] });
+    const empty = { system: [] };
+    await hooks["experimental.chat.system.transform"]({ sessionID: SID, model: {} }, empty);
+    assert.equal(empty.system.length, 1); assert.ok(empty.system[0].startsWith("<task_list>"));
+    // enforce adds nothing
+    const e = await make(impl, { mode: "enforce" });
+    assert.deepEqual(await request(e.hooks), [BASE]);
   });
 }

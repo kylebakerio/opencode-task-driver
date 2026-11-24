@@ -80,7 +80,8 @@ Fixed limits: 40 tasks per session; longer text is clipped at 200 characters for
 
 ## How it works
 
-1. **Planning.** Until tasks are filed, every main-agent request carries a short system-prompt block (832 characters):
+1. **Planning.** Until tasks are filed, every main-agent request carries a short block (832 characters), appended to
+   opencode's system prompt so the request still has a single system message:
    if the request contains more than one separate problem, call `file_tasks` before starting, one task per problem,
    each written out completely (symptoms, exact error text and quotes, expected behaviour, constraints, where to look)
    so it can be done from its own text alone.
@@ -160,7 +161,7 @@ client has exited.
 | `event` | stable | `session.status` / `session.idle` (follow-ups), `session.error` and assistant `message.updated` errors (no follow-up after a failure or abort), `session.created` / `session.updated` (sub-agent sessions are skipped), `session.compacted`, `todo.updated` (`enforce`) |
 | `chat.message` | stable | a follow-up arrived (delivered) or the user said something else; remembers the agent and model for `promptAsync` |
 | `experimental.chat.messages.transform` | **experimental** | marks "the next system prompt belongs to a main-agent request" (title and summary requests get nothing) |
-| `experimental.chat.system.transform` | **experimental** | adds the planning block / the task block |
+| `experimental.chat.system.transform` | **experimental** | appends the planning block / the task block to the system prompt |
 | `experimental.session.compacting` | **experimental** | puts the task list into the summarizer's prompt |
 | `dispose` | stable | a last state write |
 
@@ -205,6 +206,9 @@ local mock model, with no GPU and no network. It needs:
 - an existing `@opencode-ai/plugin` install in `~/.config/opencode` (`package.json` + `node_modules`, which opencode
   creates on first start). Without it every opencode start waits about 70 s for an install that cannot happen offline.
 
+The mock model is strict about system messages, like the chat templates above: a request whose system message is not
+the first message gets HTTP 500, and every mode must finish with none rejected.
+
 Your opencode setup and sessions are not touched: each mode gets its own XDG config, data, state and cache directories
 and a scratch git workspace. Each mode writes a readable `transcript.md`. The scenario: a three-problem request; the
 model files three tasks, fixes the first (with a note that survives a forced compaction), stalls on the second (two
@@ -214,6 +218,10 @@ that changes this shows up.
 
 ## Versions
 
+- **0.2.1**: works with chat templates that require a single leading system message (for example Qwen3.8 Flash-Next
+  on llama.cpp with `--jinja`, which answers "System message must be at the beginning"). 0.2.0 sent its block as a
+  second system message; such a server rejected those requests and opencode retried them without the block, so the
+  plugin had no effect there. The block is now appended to opencode's system prompt.
 - **0.2.0**: the design described here.
 - **0.1.0** (the first commit): the same task list, but the agent also wrote, for every task, how to tell it was done,
   and had to say how it verified each task before closing it. In our use those per-task checks cost a lot of time and

@@ -1,6 +1,6 @@
 {
   "name": "opencode-task-driver",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "opencode plugin: split a multi-problem request into tasks and work them one at a time",
   "private": true,
   "author": "Kyle Baker",

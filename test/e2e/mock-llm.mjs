@@ -17,7 +17,9 @@ const pluginContext = (msgs) => {
   return t ? t.slice(t.indexOf("This session keeps a task list outside the conversation")).split("\n\n")[0] : null;
 };
 
-export function startMock(port, { scenario = "tasks" } = {}) {
+// strict: reject (HTTP 500, as llama.cpp does) any request with a system message that is not the first message, as
+// chat templates that take one leading system message do (Qwen3.8 Flash-Next: "System message must be at the beginning").
+export function startMock(port, { scenario = "tasks", strict = false } = {}) {
   const log = [];
   const server = http.createServer((req, res) => {
     let raw = "";
@@ -28,6 +30,10 @@ export function startMock(port, { scenario = "tasks" } = {}) {
       let body = {};
       try { body = JSON.parse(raw || "{}"); } catch {}
       const msgs = body.messages || [];
+      if (strict && msgs.some((m, i) => i > 0 && m.role === "system")) {
+        log.push({ i: log.length, kind: "rejected", system_parts: msgs.filter((m) => m.role === "system").length });
+        return json(res, 500, { error: { code: 500, message: "System message must be at the beginning.", type: "server_error" } });
+      }
       const system = msgs.filter((m) => m.role === "system").map((m) => textOf(m.content));
       const sysText = system.join("\n");
       let kind, reply;
@@ -80,6 +86,7 @@ function send(res, body, item, n) {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const port = Number(process.argv[2] || 18080), scenario = process.argv[3] || "tasks";   // node mock-llm.mjs [port] [tasks|enforce]
-  startMock(port, { scenario }).then(() => console.log(`mock (${scenario}) on 127.0.0.1:${port}`));
+  const port = Number(process.argv[2] || 18080), scenario = process.argv[3] || "tasks";   // node mock-llm.mjs [port] [tasks|enforce] [strict]
+  const strict = process.argv[4] === "strict";
+  startMock(port, { scenario, strict }).then(() => console.log(`mock (${scenario}${strict ? ", strict" : ""}) on 127.0.0.1:${port}`));
 }

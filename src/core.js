@@ -4,7 +4,7 @@
 // Every string in this file that starts with a capital letter and ends up in a tool result, the system prompt or a
 // follow-up prompt is visible to the model. Keep it plain workflow language.
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.2.1";
 
 export const DEFAULTS = Object.freeze({
   maxNudgesPerTask: 2,   // follow-up prompts for one task before it is set aside as unfinished
