@@ -1,0 +1,30 @@
+{
+  "name": "opencode-task-driver",
+  "version": "0.1.0",
+  "description": "opencode plugin: split a multi-problem request into tasks and work them one at a time",
+  "private": true,
+  "type": "module",
+  "main": "dist/opencode-task-driver.js",
+  "exports": {
+    ".": "./dist/opencode-task-driver.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/build.mjs && node --test test/core.test.js test/plugin.test.js",
+    "e2e": "node test/e2e/e2e.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin"
+  ],
+  "license": "MIT"
+}
