@@ -1,6 +1,6 @@
 {
   "name": "opencode-task-driver",
-  "version": "0.2.1",
+  "version": "0.3.1",
   "description": "opencode plugin: split a multi-problem request into tasks and work them one at a time",
   "private": true,
   "author": "Kyle Baker",
@@ -25,7 +25,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node scripts/build.mjs && node --test test/core.test.js test/plugin.test.js",
+    "test": "node scripts/build.mjs && node --test test/core.test.js test/plugin.test.js test/compat.test.js test/focus-core.test.js test/focus-plugin.test.js test/focus31-core.test.js test/focus31-plugin.test.js",
     "e2e": "node test/e2e/e2e.mjs"
   },
   "engines": {

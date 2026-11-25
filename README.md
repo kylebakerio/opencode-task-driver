@@ -8,7 +8,7 @@ task still open, and one full test run closes the session.
 A request with a single problem is left alone: no tools are called and no follow-ups are sent.
 
 - One JavaScript file, no dependencies.
-- Modes: `tasks` (default), `enforce` and `off`. See [Modes](#modes).
+- Modes: `focus` (default), `tasks`, `enforce` and `off`. See [Modes](#modes).
 - Tested with opencode 1.18.34 on Linux. See [Compatibility](#compatibility).
 
 ## Quick start
@@ -19,8 +19,8 @@ mkdir -p ~/.config/opencode/plugin
 cp opencode-task-driver/dist/opencode-task-driver.js ~/.config/opencode/plugin/
 ```
 
-Start opencode as usual; the plugin runs in `tasks` mode. To choose a mode, set `OPENCODE_TASK_DRIVER=enforce` (or
-`tasks`, `off`) in opencode's environment, or load the plugin from `opencode.json` with options (see
+Start opencode as usual; the plugin runs in `focus` mode. To choose a mode, set `OPENCODE_TASK_DRIVER=tasks` (or
+`focus`, `enforce`, `off`) in opencode's environment, or load the plugin from `opencode.json` with options (see
 [Install](#install)).
 
 ## Why
@@ -34,7 +34,8 @@ its own, and followed up until it is finished, given up, or set aside.
 
 | mode | what the agent gets | use it when |
 |---|---|---|
-| `tasks` (default) | the planning instructions, six task tools, the current task in the system prompt, follow-ups, a final test run | the requests you give the agent often hold several separate problems |
+| `focus` (default) | `tasks`, plus a clean slate per task: once a task is closed, the agent sees a fresh conversation for the next one, framed by a task context (the request as background, the task list with what each closed task handed off, the files changed so far, the current task last). `finish_task` and `give_up_task` take a handoff | long multi-problem sessions, where the earlier tasks' conversation crowds out the current one |
+| `tasks` | the planning instructions, six task tools, the current task in the system prompt, follow-ups, a final test run; the whole conversation stays in view | the requests you give the agent often hold several separate problems |
 | `enforce` | no instructions and no tools. The plugin follows opencode's built-in todo list (`todowrite`): if the agent stops with todo items still `pending` or `in_progress`, a follow-up asks it to continue them | you only want "do not stop with open todo items", and nothing added to the prompt |
 | `off` | the plugin loads and does nothing | |
 
@@ -55,7 +56,7 @@ from a project's `.opencode/plugin/` (`plugins/` works too). Options cannot be p
 ```json
 {
   "plugin": [
-    ["file:///path/to/opencode-task-driver/dist/opencode-task-driver.js", { "mode": "tasks" }]
+    ["file:///path/to/opencode-task-driver/dist/opencode-task-driver.js", { "mode": "focus" }]
   ]
 }
 ```
@@ -68,20 +69,23 @@ All options are optional.
 
 | option | default | meaning |
 |---|---|---|
-| `mode` | `tasks` | `tasks`, `enforce` or `off`; the environment variable `OPENCODE_TASK_DRIVER` overrides it |
+| `mode` | `focus` | `focus`, `tasks`, `enforce` or `off`; the environment variable `OPENCODE_TASK_DRIVER` overrides it |
 | `delivery` | `auto` | how follow-ups are sent: `prompt`, `file` or `auto`; see [`opencode run`](#opencode-run-and-outside-drivers) |
 | `dir` | `$XDG_DATA_HOME/opencode/task-driver` (else `~/.local/share/opencode/task-driver`) | where the state files and the event log go |
 | `maxNudgesPerTask` | `2` | follow-ups for one task (or todo item) before it is set aside as unfinished |
 | `maxPrompts` | `24` | follow-ups per session, all kinds together |
 | `finalPass` | `true` | ask for one full test run once every task is closed |
+| `fileMap` | `true` | `focus` only: record the files each task read and changed and show them to the tasks after it; the handoff asks for locations |
+| `testRule` | `true` | `focus` only: the work rules say to run only the task's tests while working and the full suite (and any build or lint) once, at the end |
+| `requirementsCheck` | `true` | `focus` only: the closing request also asks to re-read the request and check each stated requirement and example against the changes |
 
-Fixed limits: 40 tasks per session; longer text is clipped at 200 characters for a title, 20,000 for task details and
-4,000 for a note, a summary or a reason; a task keeps its last 50 notes.
+Fixed limits: 40 tasks per session; longer text is clipped at 200 characters for a title, 20,000 for task details or a
+handoff, 4,000 for a note, a summary or a reason, and 32,000 for the request repeated in the task context; a task keeps
+its last 50 notes; the task context lists at most 100 changed files.
 
 ## How it works
 
-1. **Planning.** Until tasks are filed, every main-agent request carries a short block (832 characters), appended to
-   opencode's system prompt so the request still has a single system message:
+1. **Planning.** Until tasks are filed, every main-agent request carries a short system-prompt block (832 characters):
    if the request contains more than one separate problem, call `file_tasks` before starting, one task per problem,
    each written out completely (symptoms, exact error text and quotes, expected behaviour, constraints, where to look)
    so it can be done from its own text alone.
@@ -116,6 +120,51 @@ Fixed limits: 40 tasks per session; longer text is clipped at 200 characters for
 
 Everything the model sees is plain workflow language. The agent is never asked to state or prove how it checked a
 task.
+
+## Focus mode
+
+`focus` is `tasks` with a clean slate per task. Task 1 is worked in the conversation the request arrived in. From
+then on, each time a task is closed and the next becomes current, the conversation the agent sees starts afresh:
+
+- **The view, not the session.** Through `experimental.chat.messages.transform` the plugin leaves out every message
+  from before the boundary (whole messages, so a tool call is never separated from its result) and opens with one
+  start message ("We are now on task 2 of 3: ... Work on this task now." -- or, after the last task, the final-pass
+  request). When the plugin itself moved on (a task set aside after its follow-ups), its follow-up is the start
+  message. The stored session is never changed: `opencode export` still has everything.
+- **The task context** (appended to opencode's own system prompt, so the request still has exactly one system
+  message; byte-stable within a task), in this order: the request, verbatim, marked as
+  background ("It is here for reference: we broke it down into the tasks listed after it ..."); the task list, with
+  each closed task's handoff (and a given-up task's reason; a task set aside without a handoff shows its notes); the files
+  changed so far, from git (`git diff --name-status <the commit at the start>` plus untracked files, minus what was
+  already changed when the work began), refreshed at each task start; and the current task in full, last.
+- **Handoffs.** `finish_task(id, handoff)` and `give_up_task(id, reason, handoff)`: what the remaining tasks need from
+  this one (files, helpers, test commands, cautions), asked to be focused and terse. No length rule. In `focus` the
+  handoff is `finish_task`'s one prose field (no summary).
+- **File map** (`fileMap`, on by default). The files each task read (opencode's `read` tool, and the files a `bash`
+  command reads: `cat`, `sed -n`, `head`, `tail`, `nl`, `less`, `wc`, and `grep` / `rg` file arguments, after any `cd`;
+  existing files inside the workspace only) and changed (`edit`,
+  `write`, patches, and what git shows changed by the end of the task) are kept with the task list. Every later task's
+  context lists them under "Files the earlier tasks looked at (task numbers; * = changed in that task)", one line per
+  file (`- src/sync.js: 1*, 2`), at most 60. With it on, the handoff asks for "where things are and what you changed:
+  the files and functions that matter for the remaining tasks, how they connect, and any gotchas. No test-status report
+  (the task list tracks status)."
+- **Test discipline** (`testRule`, on by default). The work rules add: "While working on a task, run only the tests for
+  that task; the full test suite (and any build or lint step) runs once, at the end, after the last task."
+- **Requirements check** (`requirementsCheck`, on by default). The one closing request, once every task is closed,
+  reads: "As a last step, re-read the original request (it is in the task context) and check each requirement and
+  example it states against the changes made, especially the conditions that tell cases apart (for example a case that
+  should still behave as it does now). Fix any gap you find. Then run the project's full test suite (and any build or
+  lint step, or the closest equivalent) once, ..." It is still one follow-up (or part of the last `finish_task` result).
+- **Planning** also asks for the tasks in dependency order, with a note in a task's details when it needs another
+  task's change (for example a button another task adds).
+- **Compaction.** opencode runs the same transform on the messages it hands its summarizer, so a compaction inside a
+  task summarizes only that task's conversation. The task list goes into the summarizer's prompt as in `tasks`. If
+  opencode's previous summary was written before the current task began, opencode would ask the summarizer to carry it
+  forward; the plugin then supplies the whole summarizer prompt itself (`output.prompt`), without that summary. A
+  compaction opencode starts right at a boundary (the closing step still counted the old, full conversation)
+  summarizes nothing of the new task; it is left out of the view, together with opencode's "Continue if you have
+  next steps, or stop and ask ..." message.
+- The final full-test-suite request stays: it is the check that the tasks' changes work together.
 
 ## `opencode run` and outside drivers
 
@@ -157,12 +206,12 @@ client has exited.
 
 | hook | stable? | used for |
 |---|---|---|
-| `tool` | stable | the six task tools (`tasks` mode). Arguments are plain JSON Schema, which opencode 1.18 accepts for plugin tools; the plugin validates them itself (local models often send arrays and numbers as strings) |
+| `tool` | stable | the six task tools (`focus` and `tasks` modes). Arguments are plain JSON Schema, which opencode 1.18 accepts for plugin tools; the plugin validates them itself (local models often send arrays and numbers as strings) |
 | `event` | stable | `session.status` / `session.idle` (follow-ups), `session.error` and assistant `message.updated` errors (no follow-up after a failure or abort), `session.created` / `session.updated` (sub-agent sessions are skipped), `session.compacted`, `todo.updated` (`enforce`) |
 | `chat.message` | stable | a follow-up arrived (delivered) or the user said something else; remembers the agent and model for `promptAsync` |
-| `experimental.chat.messages.transform` | **experimental** | marks "the next system prompt belongs to a main-agent request" (title and summary requests get nothing) |
-| `experimental.chat.system.transform` | **experimental** | appends the planning block / the task block to the system prompt |
-| `experimental.session.compacting` | **experimental** | puts the task list into the summarizer's prompt |
+| `experimental.chat.messages.transform` | **experimental** | marks "the next system prompt belongs to a main-agent request" (title and summary requests get nothing); `focus`: the clean-slate view, for the agent and for the summarizer |
+| `experimental.chat.system.transform` | **experimental** | adds the planning block / the task block (`focus`: the task context) |
+| `experimental.session.compacting` | **experimental** | puts the task list into the summarizer's prompt (`focus`: the whole prompt when opencode's previous summary predates the task) |
 | `dispose` | stable | a last state write |
 
 The experimental hooks can change shape in any opencode release; the tests pin the 1.18.34 behaviour.
@@ -177,6 +226,10 @@ The experimental hooks can change shape in any opencode release; the tests pin t
 - Follow-ups add turns: per task at most 2 follow-ups plus the hand-over to the next task (or the final pass), and never
   more than 24 per session.
 - `enforce` counts only what `todowrite` says; a model that never keeps a todo list is never followed up.
+- `tasks` mode (as in 0.2.0) adds its block as a second system message. Chat templates that allow only one leading
+  system message (Qwen3.8 Flash-Next on llama.cpp `--jinja`: "System message must be at the beginning") reject those
+  requests; opencode retries the step without the block, so the agent never sees it. `focus` appends its block to the
+  existing system prompt instead and is not affected.
 - Sub-agent sessions are never driven or injected into (they can still call the tools, which keep a separate list).
 - Exercised with `opencode run`, `opencode serve` (HTTP) and the plain TUI.
 
@@ -189,14 +242,14 @@ changes them, run the end-to-end test below against it.
 ## Tests
 
 ```sh
-npm test       # builds dist/ from src/, then the unit tests: the core state machine, and the adapter driven with
-               # opencode's event order (both src/ and the built file)
+npm test       # builds dist/ from src/, then the unit tests: the core state machine, the adapter driven with
+               # opencode's event order (both src/ and the built file), focus mode, and test/compat.test.js
 npm run e2e    # end to end against the real opencode binary and a scripted mock model
 ```
 
 `npm test` needs Node 18 or newer and nothing else.
 
-`npm run e2e` (`test/e2e/e2e.mjs [serve|run|probe|enforce|enforce-serve|all] [--out DIR]`) runs opencode against a
+`npm run e2e` (`test/e2e/e2e.mjs [focus|focus-serve|focus-edge|serve|run|probe|enforce|enforce-serve|all] [--out DIR]`) runs opencode against a
 local mock model, with no GPU and no network. It needs:
 
 - Linux with bubblewrap (`bwrap`): the test re-runs itself inside `bwrap --unshare-net`. `--no-sandbox` skips that, at
@@ -206,23 +259,25 @@ local mock model, with no GPU and no network. It needs:
 - an existing `@opencode-ai/plugin` install in `~/.config/opencode` (`package.json` + `node_modules`, which opencode
   creates on first start). Without it every opencode start waits about 70 s for an install that cannot happen offline.
 
-The mock model is strict about system messages, like the chat templates above: a request whose system message is not
-the first message gets HTTP 500, and every mode must finish with none rejected.
-
 Your opencode setup and sessions are not touched: each mode gets its own XDG config, data, state and cache directories
 and a scratch git workspace. Each mode writes a readable `transcript.md`. The scenario: a three-problem request; the
 model files three tasks, fixes the first (with a note that survives a forced compaction), stalls on the second (two
 follow-ups, then it is set aside), is handed the third, finishes it, runs the final test pass, and stops. `probe` checks
 that `opencode run` still exits at the first idle without answering an in-process follow-up, so an opencode upgrade
-that changes this shows up.
+that changes this shows up. The `focus` modes run the same scenario and check, request by request, what the model was
+shown after each boundary and what the summarizer was given for a compaction inside task 2; `focus-edge` has opencode
+compact right at a boundary.
 
 ## Versions
 
-- **0.2.1**: works with chat templates that require a single leading system message (for example Qwen3.8 Flash-Next
-  on llama.cpp with `--jinja`, which answers "System message must be at the beginning"). 0.2.0 sent its block as a
-  second system message; such a server rejected those requests and opencode retried them without the block, so the
-  plugin had no effect there. The block is now appended to opencode's system prompt.
-- **0.2.0**: the design described here.
+- **0.3.1**: `focus` gains the file map, the test-discipline line and the requirements check in the closing request
+  (all on by default; with `fileMap: false, testRule: false, requirementsCheck: false` it is 0.3.0's `focus` exactly,
+  which `test/compat.test.js` checks against the frozen 0.3.0 build).
+- **0.3.0**: adds `focus` (the clean slate per task, the task context, handoffs instead of summaries) and makes it the
+  default. `tasks` and
+  `enforce` behave exactly as in 0.2.0: `test/compat.test.js` compares every string the model can see, and the
+  conversation it is shown, against the frozen 0.2.0 build.
+- **0.2.0**: `tasks`.
 - **0.1.0** (the first commit): the same task list, but the agent also wrote, for every task, how to tell it was done,
   and had to say how it verified each task before closing it. In our use those per-task checks cost a lot of time and
   output and rarely changed what got fixed. 0.2.0 replaces it.

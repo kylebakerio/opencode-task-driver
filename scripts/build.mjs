@@ -18,7 +18,7 @@ if (/^\s*(import|export)\b/m.test(coreBody)) throw new Error("src/core.js must h
 const IMPORT = 'import * as core from "./core.js";';
 if (!plugin.includes(IMPORT)) throw new Error(`src/plugin.js must contain: ${IMPORT}`);
 const inlined = `const core = (() => {\n${coreBody.trim()}\nreturn { ${names.join(", ")} };\n})();`;
-const body = plugin.replace(IMPORT, inlined);
+const body = plugin.replace(IMPORT, () => inlined);   // a function: "$`", "$&" etc. in the source are not replacement patterns
 const exportsLeft = [...body.matchAll(/^export /gm)].length;
 if (exportsLeft !== 1) throw new Error(`the built file must have exactly one export, found ${exportsLeft}`);
 

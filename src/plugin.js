@@ -3,27 +3,71 @@
 //
 // Hooks used:
 //   tool                                   file_tasks, add_task, task_note, finish_task, give_up_task, list_tasks
-//                                          (tasks mode)
+//                                          (focus and tasks modes; focus's finish_task / give_up_task take a handoff)
 //   event                                  session.status / session.idle (follow-ups), session.error and assistant
 //                                          errors (no follow-up after a failure or an abort), session.created
 //                                          (sub-agent sessions are left alone), session.compacted, todo.updated
 //   chat.message                           a follow-up arrived (delivered) or the user said something else
-//   experimental.chat.messages.transform   marks "the next system prompt is a main-agent request"
-//   experimental.chat.system.transform     the planning instructions / the task block, appended to opencode's system
-//                                          prompt (one system message)
+//   experimental.chat.messages.transform   marks "the next system prompt is a main-agent request"; focus mode: the
+//                                          clean slate (the model's view, and the summarizer's, starts at the task)
+//   experimental.chat.system.transform     the planning instructions / the task block (focus: the task context,
+//                                          appended to opencode's system prompt: one system message, not two)
 //   experimental.session.compacting        the task list goes into the summarizer's prompt
 //   dispose                                last state write
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import * as core from "./core.js";
 
 const TITLE_PROMPT = "You are a title generator";   // opencode's title agent; its requests get nothing from us
 
 function resolveMode(options) {
-  const raw = String(process.env.OPENCODE_TASK_DRIVER || (options && options.mode) || "tasks").trim().toLowerCase();
+  const raw = String(process.env.OPENCODE_TASK_DRIVER || (options && options.mode) || "focus").trim().toLowerCase();
   if (["off", "0", "false", "no", "none"].includes(raw)) return "off";
-  return raw === "tasks" || raw === "enforce" ? raw : { invalid: raw };
+  return raw === "focus" || raw === "tasks" || raw === "enforce" ? raw : { invalid: raw };
+}
+
+// ---- focus mode: the files changed so far, from git (read-only commands, no index lock, bounded) ----
+function git(dir, args) {
+  return execFileSync("git", ["--no-optional-locks", "-c", "core.quotepath=off", ...args], {
+    cwd: dir, encoding: "utf8", timeout: 5000, maxBuffer: 8 << 20, stdio: ["ignore", "pipe", "ignore"],
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+  });
+}
+// [{s, p}]: tracked changes against `base` (committed or not) and untracked files (directories collapsed)
+function gitEntries(top, base) {
+  const out = [];
+  const z = git(top, ["diff", "--name-status", "-M", "-z", base]).split("\0");
+  for (let i = 0; i < z.length - 1;) {
+    const st = z[i++];
+    if (!st) continue;
+    const k = st[0];
+    if (k === "R" || k === "C") { const from = z[i++], to = z[i++]; out.push({ s: k, p: `${from} -> ${to}` }); }
+    else out.push({ s: k, p: z[i++] });
+  }
+  for (const p of git(top, ["ls-files", "-z", "--others", "--exclude-standard", "--directory", "--no-empty-directory"]).split("\0")) if (p) out.push({ s: "?", p });
+  return out;
+}
+// {top, base, start[]}: the repository, its commit and the changed files when the work began; null outside git
+function gitSnapshot(dir) {
+  try {
+    const top = git(dir, ["rev-parse", "--show-toplevel"]).trim();
+    const base = git(top, ["rev-parse", "HEAD"]).trim();
+    return { top, base, start: gitEntries(top, base) };
+  } catch { return null; }
+}
+// the files changed since the snapshot: what is changed now and was not already changed (the same way) back then
+function gitFiles(snap) {
+  if (!snap) return null;
+  try {
+    const was = new Set(snap.start.map((e) => e.s + "\0" + e.p));
+    return gitEntries(snap.top, snap.base).filter((e) => !was.has(e.s + "\0" + e.p));
+  } catch { return null; }
+}
+// the text of a user message as the model saw it (text parts, attached file contents included)
+function userText(parts) {
+  return (parts || []).filter((x) => x && x.type === "text" && !x.ignored && x.text).map((x) => x.text).join("\n").trim();
 }
 
 // "prompt": the plugin sends follow-ups itself (TUI, `opencode serve`, `opencode run --attach` servers).
@@ -56,7 +100,7 @@ export const TaskDriver = async (input, options = {}) => {
   };
   const mode = resolveMode(options);
   if (mode === "off") { log({ event: "loaded", mode: "off", version: core.VERSION }); return {}; }
-  if (typeof mode === "object") { log({ event: "error", error: `unknown mode ${JSON.stringify(mode.invalid)}; expected tasks, enforce or off` }); return {}; }
+  if (typeof mode === "object") { log({ event: "error", error: `unknown mode ${JSON.stringify(mode.invalid)}; expected focus, tasks, enforce or off` }); return {}; }
   const delivery = resolveDelivery(options);
   const opts = {
     maxNudgesPerTask: Number.isInteger(options.maxNudgesPerTask) ? options.maxNudgesPerTask : core.DEFAULTS.maxNudgesPerTask,
@@ -64,7 +108,18 @@ export const TaskDriver = async (input, options = {}) => {
     finalPass: options.finalPass === undefined ? core.DEFAULTS.finalPass : Boolean(options.finalPass),
   };
   const client = input && input.client;
-  log({ event: "loaded", mode, delivery, version: core.VERSION, ...opts });
+  // focus-mode features (0.3.1, both on by default): fileMap (what each task read and changed, shown to the tasks after
+  // it; the handoff asks for locations) and testRule (task tests only while working, the full suite once at the end).
+  // Both off: focus is exactly 0.3.0's (no feature on the state, no tool hook, the 0.3.0 texts).
+  // requirementsCheck (0.3.1, on by default): the closing request also asks to check the request's requirements.
+  const features = mode === "focus" ? { file_map: options.fileMap !== false, test_rule: options.testRule !== false,
+                                        requirements_check: options.requirementsCheck !== false } : null;
+  const featureList = features ? [...(features.file_map ? ["file-map"] : []), ...(features.test_rule ? ["test-rule"] : []),
+                                  ...(features.requirements_check ? ["requirements-check"] : [])] : [];
+  log({ event: "loaded", mode, delivery, version: core.VERSION, ...opts, ...(featureList.length ? { features: featureList } : {}) });
+  const focus = mode === "focus";
+  const directory = (input && (input.directory || input.worktree)) || process.cwd();
+  const gitStart = focus ? gitSnapshot(directory) : null;   // the workspace before this process's model did anything
 
   // ---- per-session records ----
   const recs = new Map();          // session id -> {state, busy, child, lastErr, cycleErr, agent, model}
@@ -72,14 +127,14 @@ export const TaskDriver = async (input, options = {}) => {
   const compactingNow = new Set(); // sessions in the middle of a compaction
   const rec = (sid) => {
     let r = recs.get(sid);
-    if (!r) { r = { state: undefined, busy: false, child: false, lastErr: null, cycleErr: null, agent: undefined, model: undefined }; recs.set(sid, r); }
+    if (!r) { r = { state: undefined, busy: false, child: false, lastErr: null, cycleErr: null, agent: undefined, model: undefined, firstText: undefined }; recs.set(sid, r); }
     return r;
   };
   const fileOf = (sid) => path.join(dir, String(sid).replace(/[^A-Za-z0-9_-]/g, "_") + ".json");
   function load(sid) {
     try {
       const s = JSON.parse(fs.readFileSync(fileOf(sid), "utf8"));
-      if (s && s.v === 1 && Array.isArray(s.tasks)) { s.mode = mode; return s; }
+      if (s && s.v === 1 && Array.isArray(s.tasks)) { s.mode = mode; core.setFeatures(s, features); return s; }
     } catch {}
     return null;
   }
@@ -91,7 +146,7 @@ export const TaskDriver = async (input, options = {}) => {
   }
   function stateFor(sid) {
     const r = rec(sid);
-    if (!peek(sid)) r.state = core.newState(sid, mode);
+    if (!peek(sid)) r.state = core.newState(sid, mode, features);
     return r.state;
   }
   // Synchronous on purpose: `opencode run` disposes the instance a few ms after idle, before any await returns.
@@ -134,7 +189,12 @@ export const TaskDriver = async (input, options = {}) => {
     if (!s) return;                       // nothing filed (tasks) / no todo list seen (enforce): inert
     if (s.pending) { log({ event: "pending-dropped", session: sid, kind: s.pending.kind }); s.pending = null; }
     const before = s.stopped;
+    const curBefore = focus ? (core.currentTask(s) || { id: 0 }).id : 0;
     const act = core.decide(s, opts);
+    if (focus && s.tasks.length && (core.currentTask(s) || { id: 0 }).id !== curBefore) {   // the plugin moved on (set a task aside): the follow-up starts the next view; git runs only then
+      const b = core.markBoundary(s, curBefore, { at: Date.now(), message: null, files: gitFiles(s.git), tool: false });
+      if (b) log({ event: "boundary", session: sid, n: b.n, task: b.task, by: "followup" });
+    }
     if (!act) {
       if (s.stopped && s.stopped !== before) log({ event: "stopped", session: sid, reason: s.stopped });
       save(sid);
@@ -183,7 +243,11 @@ export const TaskDriver = async (input, options = {}) => {
           if (!p.sessionID) break;
           compactingNow.delete(p.sessionID);
           const s = peek(p.sessionID);
-          if (s && s.tasks.length) { s.compactions += 1; save(p.sessionID); log({ event: "compacted", session: p.sessionID, n: s.compactions }); }
+          if (s && s.tasks.length) {
+            s.compactions += 1;
+            if (focus) s.compacted_at = Date.now();
+            save(p.sessionID); log({ event: "compacted", session: p.sessionID, n: s.compactions });
+          }
           break;
         }
         case "todo.updated": {
@@ -204,6 +268,7 @@ export const TaskDriver = async (input, options = {}) => {
       if (inp.model) r.model = inp.model;
       r.lastErr = null; r.cycleErr = null;
       const s = peek(sid);
+      if (focus && !r.child && r.firstText === undefined && !s) r.firstText = userText(out && out.parts) || null;   // a candidate for the request
       if (!s || !s.pending) return;
       const text = ((out && out.parts) || []).filter((x) => x && x.type === "text" && !x.synthetic).map((x) => x.text).join("\n");
       const ev = core.seeUserMessage(s, text);
@@ -216,7 +281,9 @@ export const TaskDriver = async (input, options = {}) => {
       const last = msgs[msgs.length - 1];
       const sid = last && last.info && last.info.sessionID;
       if (!sid) return;
-      if (compactingNow.has(sid)) { compactingNow.delete(sid); return; }   // the summarizer's request
+      const summarizer = compactingNow.has(sid);
+      if (focus && !rec(sid).child) focusView(sid, msgs, summarizer ? "summarizer" : "request");
+      if (summarizer) { compactingNow.delete(sid); return; }   // the summarizer's request
       mainStep.add(sid);
     }),
 
@@ -227,15 +294,16 @@ export const TaskDriver = async (input, options = {}) => {
       if (!mainStep.has(sid)) return;
       mainStep.delete(sid);
       if (rec(sid).child) return;
-      const s = peek(sid) || core.newState(sid, mode);   // no tasks yet: the planning block (nothing saved)
+      const s = peek(sid) || core.newState(sid, mode, features);   // no tasks yet: the planning block (nothing saved)
       const key = s.view && s.view.key;
       const block = core.systemBlock(s);
       if (!block) return;
-      // INTO the system prompt (0.2.1): opencode sends each element of this array as its own system message, and some
-      // chat templates take only one leading system message (Qwen3.8 Flash-Next on llama.cpp --jinja: "System message must
-      // be at the beginning"); such a request fails and opencode retries the step without the block.
+      // focus mode: INTO the system prompt, so the request keeps exactly one leading system message. opencode sends each
+      // element of this array as its own system message, and some chat templates reject a second one (Qwen3.8 Flash-Next
+      // on llama.cpp --jinja: "System message must be at the beginning"); opencode then retries the step without the
+      // block. tasks / enforce: a separate element, as in 0.2.0.
       const last = out.system.length - 1;
-      if (last >= 0 && typeof out.system[last] === "string") out.system[last] = `${out.system[last]}\n\n${block}`;
+      if (focus && last >= 0 && typeof out.system[last] === "string") out.system[last] = `${out.system[last]}\n\n${block}`;
       else out.system.push(block);
       if (s.tasks.length && s.view.key !== key) {
         save(sid);
@@ -249,6 +317,12 @@ export const TaskDriver = async (input, options = {}) => {
       compactingNow.add(sid);
       if (!core.drivesTasks(mode)) return;
       const s = peek(sid);
+      if (focus && s && core.priorSummaryBeforeBoundary(s) && out) {
+        // opencode would hand the summarizer its previous summary, written before this task began, to carry forward
+        out.prompt = core.summarizerPrompt(s);
+        log({ event: "compaction-prompt", session: sid, tasks: s.tasks.length, reason: "previous summary predates the task" });
+        return;
+      }
       const ctx = s && core.compactionContext(s);
       if (ctx && out && Array.isArray(out.context)) { out.context.push(ctx); log({ event: "compaction-context", session: sid, tasks: s.tasks.length }); }
     }),
@@ -259,38 +333,156 @@ export const TaskDriver = async (input, options = {}) => {
     }),
   };
 
-  if (core.drivesTasks(mode)) hooks.tool = tools({ stateFor, save, log, opts });
+  // focus mode: what the model (or the summarizer) sees of the conversation. opencode passes its own array and keeps
+  // using that array afterwards, so it is changed in place. The stored session is never touched.
+  function focusView(sid, msgs, kind) {
+    const s = peek(sid);
+    if (!s) {                               // nothing filed yet: remember the first request as a candidate
+      const r = rec(sid);
+      const first = msgs[0];
+      if (r.firstText === undefined && first && first.info && first.info.role === "user" && !(first.parts || []).some((x) => x && x.type === "compaction"))
+        r.firstText = userText(first.parts) || null;
+      return;
+    }
+    const view = core.viewMessages(s, msgs);
+    if (!view) return;
+    if (kind === "summarizer" && core.noteSummarizerView(s, view)) {
+      save(sid);
+      log({ event: "hollow-compaction", session: sid, boundary: s.boundary.n });
+    }
+    const dropped = msgs.length - view.filter((m) => msgs.includes(m)).length;
+    msgs.splice(0, msgs.length, ...view);
+    const key = `${kind}:${s.boundary.n}:${dropped}`;
+    if (rec(sid).viewLogged !== key) { rec(sid).viewLogged = key; log({ event: "view", session: sid, kind, boundary: s.boundary.n, dropped, kept: msgs.length }); }
+  }
+
+  // focus mode: the session's first user message, for the task context (the stored session is the authority; the
+  // messages seen in this process are the fallback)
+  async function firstRequest(sid) {
+    try {
+      if (client && client.session && client.session.messages) {
+        const res = await Promise.race([client.session.messages({ path: { id: sid } }), new Promise((r) => setTimeout(() => r(null), 5000))]);
+        const list = (res && (res.data || res)) || [];
+        if (Array.isArray(list)) {
+          const first = list.find((m) => m && m.info && m.info.role === "user" && !(m.parts || []).some((x) => x && x.type === "compaction"));
+          const text = first && userText(first.parts);
+          if (text) return text;
+        }
+      }
+    } catch (e) { log({ event: "error", where: "first-request", session: sid, error: String(e && e.message || e).slice(0, 300) }); }
+    return rec(sid).firstText || null;
+  }
+
+  // focus + file map: the files the model reads and changes through opencode's tools (read; edit / write / multiedit /
+  // patches; and files a bash command reads, core.bashReadCandidates), credited to the current task
+  // (before anything is filed: kept here and credited to task 1 at filing). Paths relative to the workspace; files
+  // outside it, under node_modules or .git are left out.
+  const pending = new Map();   // session id -> [[kind, path]] seen before filing
+  function relPath(p) {
+    let v = String(p || "").trim();
+    if (!v) return null;
+    if (path.isAbsolute(v)) {
+      const base = directory.replace(/\/+$/, "") + "/";
+      if (!v.startsWith(base)) return null;
+      v = v.slice(base.length);
+    }
+    v = path.posix.normalize(v.replace(/^\.\//, ""));
+    if (!v || v === "." || v.startsWith("../") || /(^|\/)node_modules\//.test(v) || /^\.git(\/|$)/.test(v)) return null;
+    return v;
+  }
+  function filesOfTool(tool, args) {
+    const a = args || {};
+    if (tool === "read") return [["read", a.filePath ?? a.path]];
+    if (tool === "edit" || tool === "write" || tool === "multiedit") return [["changed", a.filePath ?? a.path]];
+    if (tool === "bash") {   // files a command reads (cat, sed -n, head, tail, nl, less, wc, grep/rg file arguments)
+      try {
+        const base = a.workdir ? path.resolve(directory, String(a.workdir)) : directory;
+        const out = [];
+        for (const c of core.bashReadCandidates(a.command)) {
+          const abs = path.resolve(c.cwd ? path.resolve(base, c.cwd) : base, c.file);
+          try { if (fs.statSync(abs).isFile()) out.push(["read", abs]); } catch {}
+        }
+        return out;
+      } catch { return []; }
+    }
+    if (tool === "apply_patch" || tool === "patch") {
+      const text = String(a.patchText ?? a.patch ?? a.input ?? "");
+      return [...text.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map((m) => ["changed", m[1].trim()]);
+    }
+    return [];
+  }
+  if (focus && features.file_map) {
+    hooks["tool.execute.after"] = async (inp) => guard("tool.after", () => {
+      const sid = inp && inp.sessionID;
+      if (!sid || rec(sid).child) return;
+      const found = filesOfTool(inp.tool, inp.args).map(([k, p]) => [k, relPath(p)]).filter(([, p]) => p);
+      if (!found.length) return;
+      const s = peek(sid);
+      if (!s || !s.tasks.length) {
+        const list = pending.get(sid) || [];
+        for (const f of found) if (list.length < 300) list.push(f);
+        pending.set(sid, list);
+        return;
+      }
+      let any = false;
+      for (const [k, p] of found) any = core.noteFile(s, k, p) || any;
+      if (any) save(sid);
+    });
+  }
+  const takePending = (sid) => { const l = pending.get(sid) || []; pending.delete(sid); return l; };
+
+  const focusHooks = focus ? { firstRequest, gitFiles: (s) => gitFiles(s.git || gitStart), gitStart: () => gitStart, features, takePending } : null;
+  if (core.drivesTasks(mode)) hooks.tool = tools({ stateFor, save, log, opts, focusHooks });
   return hooks;
 };
 
 // Tool argument schemas are plain JSON Schema: opencode 1.18 accepts them for plugin tools (every listed top-level
 // property is required and nothing is validated, so core.js validates). No zod import keeps this a single
 // dependency-free file. finish_task's summary may be empty (listed, so opencode shows it as required; core.js accepts
-// it empty or missing).
-function tools({ stateFor, save, log, opts }) {
+// it empty or missing). focus mode: finish_task takes the handoff instead of the summary (its one prose field) and
+// give_up_task takes one beside the reason (shown as required; the model is asked to keep it focused and terse, with no
+// length rule), and a tool call that changes the current task marks the boundary where the next task's conversation
+// begins.
+function tools({ stateFor, save, log, opts, focusHooks }) {
+  const focus = !!focusHooks;
   const run = (ctx, fn) => {
     const sid = ctx && ctx.sessionID;
     if (!sid) return "Error: no session";
     const s = stateFor(sid);
+    const curBefore = focus ? (core.currentTask(s) || { id: 0 }).id : 0;
+    const filedBefore = s.tasks.length > 0;   // filing starts task 1 in the conversation it was filed in: no boundary
     let r;
     try { r = fn(s); } catch (e) { log({ event: "error", session: sid, error: String(e && e.stack || e).slice(0, 800) }); return "Error: " + String(e && e.message || e); }
+    let b = null;
+    if (focus && filedBefore && (core.currentTask(s) || { id: 0 }).id !== curBefore) {
+      b = core.markBoundary(s, curBefore, { at: Date.now(), message: ctx.messageID || null, files: focusHooks.gitFiles(s), tool: true });
+    }
     save(sid);
     if (r.event) log({ session: sid, ...r.event });
+    if (b) log({ event: "boundary", session: sid, n: b.n, task: b.task, by: "tool" });
     return r.output;
   };
   const str = (description) => ({ type: "string", description });
   const id = { type: "integer", description: "The task's number in the task list." };
+  const handoff = str(focus && focusHooks.features.file_map
+    ? "Where things are and what you changed, focused and terse: the files and functions that matter for the remaining tasks, how they connect, and any gotchas. No test-status report (the task list tracks status). Write \"none\" if nothing."
+    : "What the remaining tasks need to know from this one, focused and terse: files, functions or helpers you added or changed that they may use, commands that run the relevant tests, cautions. Write \"none\" if nothing.");
   const item = {
     type: "object",
     properties: {
       title: str("A short name for the problem."),
-      details: str("Everything from the request that matters for this problem, written out in full: symptoms, exact error messages and quoted text, expected behaviour, constraints, where to look."),
+      details: str(focus
+        ? "Everything from the request that matters for this problem, written out in full: symptoms, exact error messages and quoted text, expected behaviour, constraints, where to look, and which other task's change it depends on, if any."
+        : "Everything from the request that matters for this problem, written out in full: symptoms, exact error messages and quoted text, expected behaviour, constraints, where to look."),
     },
     required: ["title", "details"],
   };
+  const fileArgs = (args) => args && args.tasks;
   return {
     file_tasks: {
-      description: "Split the user's request into separate tasks, one per problem, and keep them in a task list outside the conversation. Call it before starting work when the request contains more than one separate problem. Write each task completely: every detail from the request that matters for it (symptoms, exact error text and quotes, expected behaviour, constraints, where to look), so it can be done from its own text alone. Returns the first task.",
+      description: focus
+        ? "Split the user's request into separate tasks, one per problem, and keep them in a task list outside the conversation. Call it before starting work when the request contains more than one separate problem. Write each task completely: every detail from the request that matters for it (symptoms, exact error text and quotes, expected behaviour, constraints, where to look), so it can be done from its own text alone. List the tasks so that a task comes after any task it depends on. Returns the first task."
+        : "Split the user's request into separate tasks, one per problem, and keep them in a task list outside the conversation. Call it before starting work when the request contains more than one separate problem. Write each task completely: every detail from the request that matters for it (symptoms, exact error text and quotes, expected behaviour, constraints, where to look), so it can be done from its own text alone. Returns the first task.",
       args: {
         tasks: {
           type: "array",
@@ -298,7 +490,23 @@ function tools({ stateFor, save, log, opts }) {
           items: item,
         },
       },
-      execute: async (args, ctx) => run(ctx, (s) => core.fileTasks(s, args && args.tasks)),
+      execute: focus
+        ? async (args, ctx) => {
+          const sid = ctx && ctx.sessionID;
+          const known = sid ? stateFor(sid) : null;
+          const at = {};
+          if (known && !known.tasks.length) {     // about to file: the request and the git snapshot go with the list
+            at.request = await focusHooks.firstRequest(sid);
+            at.git = focusHooks.gitStart();
+            at.files = focusHooks.gitFiles({ git: at.git });
+          }
+          return run(ctx, (s) => {
+            const r = core.fileTasks(s, fileArgs(args), at);
+            if (!String(r.output).startsWith("Error")) for (const [k, p] of focusHooks.takePending(sid)) core.noteFile(s, k, p);   // reads before filing: task 1's
+            return r;
+          });
+        }
+        : async (args, ctx) => run(ctx, (s) => core.fileTasks(s, fileArgs(args))),
     },
     add_task: {
       description: "Add one more task to the task list, for a separate problem found while working. Write it as completely as file_tasks asks.",
@@ -313,16 +521,28 @@ function tools({ stateFor, save, log, opts }) {
       args: { id, text: str("The note.") },
       execute: async (args, ctx) => run(ctx, (s) => core.taskNote(s, args && args.id, args && args.text)),
     },
-    finish_task: {
-      description: "Mark a task done. Returns the next task.",
-      args: { id, summary: str("Optional: a short note of what you changed. May be left empty.") },
-      execute: async (args, ctx) => run(ctx, (s) => core.finishTask(s, args && args.id, args && args.summary, opts)),
-    },
-    give_up_task: {
-      description: "Mark a task as one that cannot be done, with the reason. Returns the next task.",
-      args: { id, reason: str("Why it cannot be done.") },
-      execute: async (args, ctx) => run(ctx, (s) => core.giveUpTask(s, args && args.id, args && args.reason, opts)),
-    },
+    finish_task: focus
+      ? {
+        description: "Mark a task done. The next task then starts in a fresh conversation that shows the task list with each finished task's handoff, so put in the handoff what the remaining tasks need from this one. Returns the next task.",
+        args: { id, handoff },
+        execute: async (args, ctx) => run(ctx, (s) => core.finishTask(s, args && args.id, undefined, opts, args && args.handoff)),
+      }
+      : {
+        description: "Mark a task done. Returns the next task.",
+        args: { id, summary: str("Optional: a short note of what you changed. May be left empty.") },
+        execute: async (args, ctx) => run(ctx, (s) => core.finishTask(s, args && args.id, args && args.summary, opts)),
+      },
+    give_up_task: focus
+      ? {
+        description: "Mark a task as one that cannot be done, with the reason and a handoff for the remaining tasks. Returns the next task.",
+        args: { id, reason: str("Why it cannot be done."), handoff },
+        execute: async (args, ctx) => run(ctx, (s) => core.giveUpTask(s, args && args.id, args && args.reason, opts, args && args.handoff)),
+      }
+      : {
+        description: "Mark a task as one that cannot be done, with the reason. Returns the next task.",
+        args: { id, reason: str("Why it cannot be done.") },
+        execute: async (args, ctx) => run(ctx, (s) => core.giveUpTask(s, args && args.id, args && args.reason, opts)),
+      },
     list_tasks: {
       description: "Show the task list with each task's status, and the current task in full.",
       args: {},

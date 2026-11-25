@@ -34,8 +34,8 @@ test("normalizeTasks accepts arrays, JSON strings and {tasks}, and rejects incom
 });
 
 test("file_tasks files once and returns task 1 in full", () => {
-  const s = core.newState("ses_x");
-  assert.equal(s.mode, "tasks");
+  assert.equal(core.newState("ses_x").mode, "focus", "focus is the default since 0.3.0");
+  const s = core.newState("ses_x", "tasks");
   const r = core.fileTasks(s, [T(1), T(2), { ...T(3), done_when: "dropped" }]);
   assert.equal(r.output, `Filed 3 tasks:\n1. Problem 1\n2. Problem 2\n3. Problem 3\n\nStart with task 1 of 3: Problem 1\n\n${T(1).details}\n\nWork on the tasks one at a time. ${RULES}`);
   assert.deepEqual(s.tasks.map((t) => t.status), ["open", "open", "open"]);
@@ -96,7 +96,7 @@ test("task_note echoes notes and does not change the system block until the view
 
 test("system block: planning text until tasks are filed; nothing in enforce mode; closed list at the end", () => {
   assert.equal(core.PLANNING_BLOCK, PLANNING);
-  assert.equal(core.systemBlock(core.newState("ses_x")), PLANNING);
+  assert.equal(core.systemBlock(core.newState("ses_x", "tasks")), PLANNING);
   assert.equal(core.systemBlock(core.newState("ses_x", "enforce")), null);
   const f = filed(1);
   core.finishTask(f, 1);

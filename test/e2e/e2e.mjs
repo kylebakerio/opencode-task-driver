@@ -3,13 +3,20 @@
 // re-runs itself inside `bwrap --unshare-net` (Linux; pass --no-sandbox to skip, at your own risk), and opencode
 // gets its own XDG config/data/state/cache directories, so your opencode setup and sessions are not touched.
 //
-//   node test/e2e/e2e.mjs [serve|run|probe|enforce|enforce-serve|all] [--out DIR] [--no-sandbox]
+//   node test/e2e/e2e.mjs [focus|focus-serve|focus-edge|serve|run|probe|enforce|enforce-serve|all] [--out DIR] [--no-sandbox]
+//                         [--strict-system]
 //
-//   The mock model is STRICT about system messages, like chat templates that take one leading system message (Qwen3.8
-//   Flash-Next on llama.cpp --jinja): a request whose system message is not the first message gets HTTP 500, and every
-//   mode must finish with none rejected (0.2.1: the plugin's block is appended to opencode's system prompt).
+//   The mock model always runs the focus modes STRICT: like Qwen3.8 Flash-Next's chat template on llama.cpp it rejects
+//   (HTTP 500) a request whose system message is not the first message, and the focus checks require zero rejections.
+//   --strict-system runs every mode that way (0.2.0's `tasks` mode sends its block as a second system message).
 //
-//   serve: `opencode serve` + HTTP, plugin delivery "prompt" (the plugin sends its follow-ups itself)
+//   focus, focus-serve: mode "focus" (0.3.0's default) driven like run / serve: each task after the first is worked in a
+//          fresh conversation. Checks what every request showed the model (the task context, and only the current
+//          task's messages after each boundary), what the summarizer was given for a compaction inside task 2 (only
+//          task 2's conversation, not opencode's previous summary from task 1), the handoffs, the git file list, the
+//          final pass, and that the stored session still holds everything.
+//
+//   serve: mode "tasks", `opencode serve` + HTTP, plugin delivery "prompt" (the plugin sends its follow-ups itself)
 //   run:   `opencode run` turns, plugin delivery "auto" (= "file" inside `opencode run`); this script is the outside
 //          driver: after each turn it reads the pending follow-up from the state file and runs
 //          `opencode run --session <id> "<text>"`.
@@ -24,7 +31,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startMock } from "./mock-llm.mjs";
-import { REQUEST } from "./scenario.mjs";
+import { REQUEST, FOCUS_HANDOFF_1 } from "./scenario.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../..");
@@ -40,11 +47,13 @@ if (!flag("--inside") && !flag("--no-sandbox")) {
   process.exit(r.status ?? 1);
 }
 
-const ALL = ["serve", "run", "probe", "enforce", "enforce-serve"];
+const ALL = ["focus", "focus-serve", "focus-edge", "serve", "run", "probe", "enforce", "enforce-serve"];
 const MODES = (() => { const m = argv.find((a) => [...ALL, "all"].includes(a)) || "all"; return m === "all" ? ALL : [m]; })();
 const isEnforce = (mode) => mode.startsWith("enforce");
-const pluginMode = (mode) => (isEnforce(mode) ? "enforce" : "tasks");
-const viaRun = (mode) => mode === "run" || mode === "enforce";     // the outside driver re-runs `opencode run`
+const isFocus = (mode) => mode.startsWith("focus");
+const pluginMode = (mode) => (isEnforce(mode) ? "enforce" : isFocus(mode) ? "focus" : "tasks");
+const mockScenario = (mode) => (mode === "focus-edge" ? "focus-edge" : pluginMode(mode));
+const viaRun = (mode) => mode === "run" || mode === "enforce" || mode === "focus" || mode === "focus-edge";     // the outside driver re-runs `opencode run`
 const OUT = path.resolve(opt("--out", fs.mkdtempSync(path.join(os.tmpdir(), "otd-e2e-"))));
 const OPENCODE = which("opencode") || path.join(os.homedir(), ".opencode/bin/opencode");
 const MODEL = { providerID: "mock", modelID: "mock-20k" };
@@ -186,7 +195,7 @@ function probeChecks(res, mock, ctx) {
 function enforceChecks(mode, res, mock, ctx) {
   const agent = mock.log.filter((r) => r.kind === "agent");
   const replies = agent.map((r) => r.reply.tool || "text");
-  const st = JSON.parse(fs.readFileSync(path.join(ctx.stateDir, res.session + ".json"), "utf8"));
+  const st = readState(ctx, res.session);
   const lastMsg = res.messages[res.messages.length - 1];
   const unwrap = (t) => (t.length >= 2 && t.startsWith('"') && t.endsWith('"') ? t.slice(1, -1).replace(/\\"/g, '"') : t);
   const userTexts = res.messages.filter((m) => m.info.role === "user")
@@ -204,6 +213,11 @@ function enforceChecks(mode, res, mock, ctx) {
 }
 
 // ---------- transcript + checks ----------
+// the plugin's state file for the session; a stand-in when the plugin never filed or saw anything (the checks then fail)
+function readState(ctx, sid) {
+  const f = path.join(ctx.stateDir, String(sid) + ".json");
+  return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : { missing: true, tasks: [], todos: [], boundary: null, files: null };
+}
 function render(messages) {
   const out = [];
   messages.forEach((m, i) => {
@@ -230,7 +244,7 @@ function checks(mode, res, mock, ctx) {
   const replies = agent.map((r) => r.reply.tool ? r.reply.tool + (r.reply.args && r.reply.args.id ? `(${r.reply.args.id})` : "") : "text");
   const comps = mock.log.filter((r) => r.kind === "compaction");
   let changes = 0; for (let i = 1; i < agent.length; i++) if (agent[i].system_sha !== agent[i - 1].system_sha) changes++;
-  const st = JSON.parse(fs.readFileSync(path.join(ctx.stateDir, res.session + ".json"), "utf8"));
+  const st = readState(ctx, res.session);
   const lastMsg = res.messages[res.messages.length - 1];
   // what was typed (opencode's own compaction request and "Continue if you have next steps" turn are left out); a
   // message sent through `opencode run "<text>"` arrives wrapped in quotes with inner quotes escaped
@@ -273,15 +287,102 @@ function textChecks(res, mock, st, userTexts) {
     ["every agent request carried the plugin's block: planning first, then task blocks", agent.every((r) => r.plugin_block) && blocks[0].startsWith("<task_planning>") && blocks.slice(1).every((b) => b.startsWith("<task_list>")), `${blocks.length} blocks over ${agent.length} agent requests`],
     ["nothing the plugin showed asks how anything was checked (blocks, follow-ups, tool results, compaction prompt)", shown.length > 10 && bad.length === 0, `${shown.length} texts, ${bad.length} matching: ${bad.map((t) => t.slice(0, 120)).join(" | ")}`],
     ["the nudges use the plain wording", userTexts.slice(1, 3).every((t) => t.endsWith("Continue working on this task. When it is done, call finish_task; if it cannot be done, call give_up_task with the reason.")), userTexts.slice(1, 3).map((t) => t.slice(-90)).join(" | ")],
-    ["state: no done_when; task 1 closed with its summary, task 3 with none; the final pass asked in the tool result", st.mode === "tasks" && st.tasks.every((t) => !("done_when" in t) && !("evidence" in t)) && st.tasks[0].summary === "Set `limit = 10` in config.txt." && st.tasks[2].summary === null && results.some((r) => /^Task 3 marked done\.\n\nAll tasks are closed \(2 done, 1 set aside unfinished\)\.\nAs a last step, run the project's full test suite/.test(r)),
-      JSON.stringify({ mode: st.mode, summaries: st.tasks.map((t) => t.summary), keys: Object.keys(st.tasks[0]) })],
+    ["state: no done_when; task 1 closed with its summary, task 3 with none; the final pass asked in the tool result", st.mode === "tasks" && st.tasks.every((t) => !("done_when" in t) && !("evidence" in t)) && (st.tasks[0] || {}).summary === "Set `limit = 10` in config.txt." && (st.tasks[2] || {}).summary === null && results.some((r) => /^Task 3 marked done\.\n\nAll tasks are closed \(2 done, 1 set aside unfinished\)\.\nAs a last step, run the project's full test suite/.test(r)),
+      JSON.stringify({ mode: st.mode, summaries: st.tasks.map((t) => t.summary), keys: Object.keys(st.tasks[0] || {}) })],
+  ];
+}
+
+// focus: the clean slate, request by request
+function focusChecks(mode, res, mock, ctx) {
+  const agent = mock.log.filter((r) => r.kind === "agent");
+  const replies = agent.map((r) => r.reply.tool ? r.reply.tool + (r.reply.args && r.reply.args.id ? `(${r.reply.args.id})` : "") : "text");
+  const comps = mock.log.filter((r) => r.kind === "compaction");
+  const st = readState(ctx, res.session);
+  const lastMsg = res.messages[res.messages.length - 1];
+  const want = ["file_tasks", "read", "bash", "task_note(1)", "finish_task(1)", "bash", "text", "text", "text", "bash", "finish_task(3)", "bash", "text"];
+  const idx = (pred) => agent.findIndex(pred);
+  const first2 = idx((r) => r.current === "2"), first3 = idx((r) => r.current === "3"), firstClosed = idx((r) => r.current === "closed");
+  const T1 = /printf 'limit|Root cause: config\.txt/;                     // task 1's conversation (its bash command, its note)
+  const REQ = /There are three separate problems in this project/;       // the request's first line
+  const shown = (r) => r.view.map((m) => m.text + " " + (m.calls || []).join(" ")).join("\n");
+  const after1 = agent.slice(first2);
+  const after2 = agent.slice(first3);
+  const c2 = comps.find((x) => /covers only the current task \(task 2 of 3/.test(x.compaction_input || ""));
+  const c1 = comps.find((x) => x !== c2);
+  const blk = agent[first2] && agent[first2].plugin_block || "";
+  const gs = spawnSync("git", ["status", "--porcelain"], { cwd: ctx.ws, encoding: "utf8" }).stdout.split("\n").filter(Boolean).sort();
+  const stored = JSON.stringify(res.messages);
+  let changes = 0; for (let i = 1; i < agent.length; i++) if (agent[i].system_sha !== agent[i - 1].system_sha) changes++;
+  const c = [
+    ["model calls in order", JSON.stringify(replies) === JSON.stringify(want), replies.join(", ")],
+    ["task 1 kept the conversation it started in (the request is its first message until opencode compacts)", agent.slice(1, 4).every((r) => r.view[0].role === "user" && REQ.test(r.view[0].text)), JSON.stringify(agent.slice(1, 4).map((r) => r.view[0].text.slice(0, 60)))],
+    ["task 2's first request: one message, the start of task 2 -- nothing from task 1, not even the request",
+      agent[first2] && agent[first2].view.length === 1 && agent[first2].view[0].role === "user" && /^We are now on task 2 of 3: Make cache entries expire\./.test(agent[first2].view[0].text),
+      JSON.stringify(agent[first2] && agent[first2].view)],
+    ["no request after the first boundary shows task 1's conversation or the request as a message", after1.every((r) => !T1.test(shown(r)) && !REQ.test(shown(r))), after1.filter((r) => T1.test(shown(r)) || REQ.test(shown(r))).map((r) => r.i).join(",")],
+    ["the task context for task 2: the request first, task 1 done with its handoff, the files, task 2 last",
+      /^<task_context>\nWe received the request below\. It is here for reference/.test(blk) && blk.includes("<request>\nThere are three separate problems") &&
+      blk.includes("1. [done] Raise the request limit in config.txt\n   Handoff: " + FOCUS_HANDOFF_1 + "\n2. [current] Make cache entries expire") &&
+      blk.includes("Files changed so far (from git, compared with the start of the work):\n- modified: config.txt") &&
+      blk.indexOf("<request>") < blk.indexOf("The tasks, in order:") && blk.indexOf("The tasks, in order:") < blk.indexOf("The current task is task 2 of 3: Make cache entries expire"),
+      blk.slice(0, 1600)],
+    ["v3.1: task 2's context maps task 1's files (config.txt read and changed in task 1)", blk.includes("\n\nFiles the earlier tasks looked at (task numbers; * = changed in that task):\n- config.txt: 1*\n\nThe current task is task 2 of 3"), blk.slice(blk.indexOf("Files changed so far"), blk.indexOf("The current task"))],
+    ["v3.1: the work rules hold the test-discipline line", blk.includes("If a task cannot be done, call give_up_task with its id, the reason and a handoff.\nWhile working on a task, run only the tests for that task; the full test suite (and any build or lint step) runs once, at the end, after the last task.\nUse task_note"), blk.slice(-600)],
+    ["v3.1: the handoff as opencode sent it asks for locations, not test status", /^Where things are and what you changed, focused and terse:/.test((((agent.map((r) => r.task_args).find(Boolean) || {}).finish_task || {}).properties || {}).handoff?.description || ""), JSON.stringify(((agent.map((r) => r.task_args).find(Boolean) || {}).finish_task || {}).properties)],
+    ["v3.1: task 1's file map entries are in the state (read via the read tool, changed via git)", JSON.stringify(st.tasks[0] && st.tasks[0].reads) === '["config.txt"]' && JSON.stringify(st.tasks[0] && st.tasks[0].changed) === '["config.txt"]', JSON.stringify(st.tasks.map((t) => [t.reads, t.changed]))],
+    ["v3.1: a file read through bash counts too (task 3's `cat page.txt`)", JSON.stringify(st.tasks[2] && st.tasks[2].reads) === '["page.txt"]', JSON.stringify(st.tasks.map((t) => t.reads))],
+    ["two compactions: one inside task 1 (opencode's prompt + the task list), one inside task 2", comps.length === 2 && !!c1 && !!c2 && c1.compaction_has_tasklist === true, `${comps.length} compaction(s)`],
+    ["the task-2 summarizer saw only task 2: its start and its bash call, not task 1's conversation, the request, or the task-1 summary",
+      !!c2 && /We are now on task 2 of 3/.test(c2.compaction_input) && /printf 'ttl = \?/.test(c2.compaction_input) && !T1.test(c2.compaction_input) && !REQ.test(c2.compaction_input) && !/fixed config\.txt \(task 1\)/.test(c2.compaction_input),
+      c2 ? c2.compaction_input.slice(0, 1500) : "(none)"],
+    ["the task-2 summarizer got the plugin's own prompt (no <prior-summary>, since opencode's previous summary was task 1's)", !!c2 && /\nSummarize the conversation below so that another coding agent can continue the work\./.test(c2.compaction_input) && !/prior-summary/.test(c2.compaction_input) && /The following is the conversation history:\n\n\[User\]: We are now on task 2 of 3/.test(c2.compaction_input), c2 ? c2.compaction_input.slice(0, 200) : ""],
+    ["after that compaction task 2's view is its summary and the continue message, still nothing from task 1", agent.slice(first2 + 1, first3).every((r) => /Task 2: started on the cache expiry/.test(shown(r)) && !T1.test(shown(r))), JSON.stringify(agent[first2 + 1] && agent[first2 + 1].view)],
+    ["task 3's first request starts with the follow-up that set task 2 aside, and nothing before it",
+      agent[first3] && agent[first3].view.length === 1 && /^"?Task 2 of 3 \(Make cache entries expire\) is set aside as unfinished\.\\?n?/.test(agent[first3].view[0].text) && !/Task 2: started/.test(shown(agent[first3])),
+      JSON.stringify(agent[first3] && agent[first3].view)],
+    ["the final pass starts fresh: one message, the requirements check (v3.1) and then the full test run", agent[firstClosed] && agent[firstClosed].view.length === 1 && /^All tasks are closed \(2 done, 1 set aside unfinished\)\.\nAs a last step, re-read the original request \(it is in the task context\) and check each requirement and example it states against the changes made, especially the conditions that tell cases apart \(for example a case that should still behave as it does now\)\. Fix any gap you find\. Then run the project's full test suite/.test(agent[firstClosed].view[0].text) && /The tasks, all now closed:/.test(agent[firstClosed].plugin_block || ""), JSON.stringify(agent[firstClosed] && agent[firstClosed].view)],
+    ["system prompt changed only at transitions (planning>1, compaction with a new note, 1>2, 2>3, 3>closed)", changes === 5, `${changes} changes over ${agent.length} agent requests`],
+    ["state: done / unfinished / done, handoffs kept, 3 boundaries, files from git", JSON.stringify(st.tasks.map((t) => t.status)) === '["done","unfinished","done"]' && (st.tasks[0] || {}).handoff === FOCUS_HANDOFF_1 && (st.tasks[2] || {}).handoff === "none" && (st.boundary || {}).n === 3 && JSON.stringify(st.files) === JSON.stringify([{ s: "M", p: "config.txt" }, { s: "M", p: "page.txt" }, { s: "?", p: "cache.txt" }]) && st.request && REQ.test(st.request), JSON.stringify({ statuses: st.tasks.map((t) => t.status), handoffs: st.tasks.map((t) => t.handoff), boundary: st.boundary && st.boundary.n, files: st.files })],
+    ["the stored session still holds everything (task 1's bash and note, the request)", T1.test(stored) && REQ.test(stored), ""],
+    ["session ends on an assistant answer", lastMsg.info.role === "assistant" && lastMsg.info.finish === "stop", `${lastMsg.info.role}/${lastMsg.info.finish}`],
+    ["workspace holds only the model's edits", JSON.stringify(gs) === JSON.stringify([" M config.txt", " M page.txt", "?? cache.txt"].sort()), gs.join(", ")],
+  ];
+  if (mode === "focus") c.push(["run turns: request, nudge, nudge, next", JSON.stringify(res.turns.map((t) => t.prompt)) === JSON.stringify(["(the request)", "nudge (task 2)", "nudge (task 2)", "next (task 3)"]), res.turns.map((t) => t.prompt).join(", ")]);
+  const texts = [...agent.map((r) => r.plugin_block || ""), ...agent.flatMap((r) => r.view.filter((m) => m.role === "user").map((m) => m.text)).filter((t) => !REQ.test(t)), ...comps.map((x) => x.compaction_text || "")];
+  const bad = texts.filter((t) => /verif|checked|how to tell|done when|done_when|evidence/i.test(t));
+  c.push(["nothing shown asks how anything was checked", bad.length === 0, bad.map((t) => t.slice(0, 120)).join(" | ")]);
+  return c;
+}
+
+// focus-edge: opencode compacts right at a boundary (the step that closed task 1 reported a nearly full window, so the
+// compaction starts before task 2's first request). Its summarizer is shown only task 2's start, and the view of task 2
+// leaves that compaction out: task 2 starts as it would have without it.
+function focusEdgeChecks(res, mock, ctx) {
+  const agent = mock.log.filter((r) => r.kind === "agent");
+  const replies = agent.map((r) => r.reply.tool ? r.reply.tool + (r.reply.args && r.reply.args.id ? `(${r.reply.args.id})` : "") : "text");
+  const comps = mock.log.filter((r) => r.kind === "compaction");
+  const want = ["file_tasks", "read", "bash", "task_note(1)", "finish_task(1)", "bash", "text", "text", "text", "bash", "finish_task(3)", "bash", "text"];
+  const first2 = agent.findIndex((r) => r.current === "2");
+  const shown = (r) => r.view.map((m) => m.text + " " + (m.calls || []).join(" ")).join("\n");
+  const conv = comps[0] && (comps[0].compaction_input.match(/<conversation>\n([\s\S]*?)\n<\/conversation>/) || [])[1];
+  const evs = fs.readFileSync(path.join(ctx.stateDir, ".events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const stored = JSON.stringify(res.messages);
+  return [
+    ["model calls in order", JSON.stringify(replies) === JSON.stringify(want), replies.join(", ")],
+    ["one compaction, between finish_task(1) and task 2's first request", comps.length === 1 && comps[0].i > agent[first2 - 1].i && comps[0].i < agent[first2].i, comps.map((x) => x.i).join(",")],
+    ["its summarizer was shown only the start of task 2", typeof conv === "string" && /^\[User\]: We are now on task 2 of 3: Make cache entries expire\./.test(conv) && conv.split("\n\n").length === 1, JSON.stringify(conv)],
+    ["the plugin noted it as hollow, once", evs.filter((e) => e.event === "hollow-compaction").length === 1, JSON.stringify(evs.filter((e) => e.event === "hollow-compaction"))],
+    ["task 2's first request is just its start: no compaction request, summary or 'stop and ask' message", agent[first2].view.length === 1 && /^We are now on task 2 of 3/.test(agent[first2].view[0].text) && !/What did we do so far/.test(agent[first2].view[0].text), JSON.stringify(agent[first2].view)],
+    ["no later request in task 2 shows that summary or opencode's continue message", agent.filter((r) => r.current === "2").every((r) => !/Task 2: started on the cache expiry|Continue if you have next steps/.test(shown(r))), ""],
+    ["the stored session still holds the compaction and opencode's continue message", /Continue if you have next steps/.test(stored) && /"summary":true/.test(stored), ""],
   ];
 }
 
 let failed = 0;
 for (const mode of MODES) {
   const mockPort = 18080 + MODES.indexOf(mode);
-  const mock = await startMock(mockPort, { scenario: pluginMode(mode), strict: true });
+  const strict = isFocus(mode) || flag("--strict-system");
+  const mock = await startMock(mockPort, { scenario: mockScenario(mode), strict });
   const ctx = setup(mode, mockPort);
   const t0 = Date.now();
   let res;
@@ -291,11 +392,11 @@ for (const mode of MODES) {
   fs.writeFileSync(path.join(ctx.dir, "transcript.md"), `# ${mode} transcript (session ${res.session})\n\n` + render(res.messages));
   fs.writeFileSync(path.join(ctx.dir, "mock-log.json"), JSON.stringify(mock.log, null, 1));
   let c;
-  try { c = mode === "probe" ? probeChecks(res, mock, ctx) : isEnforce(mode) ? enforceChecks(mode, res, mock, ctx) : checks(mode, res, mock, ctx); }
+  try { c = mode === "probe" ? probeChecks(res, mock, ctx) : isEnforce(mode) ? enforceChecks(mode, res, mock, ctx) : mode === "focus-edge" ? focusEdgeChecks(res, mock, ctx) : isFocus(mode) ? focusChecks(mode, res, mock, ctx) : checks(mode, res, mock, ctx); }
   catch (e) { c = [["the checks could run (the session went far enough to check)", false, String(e && e.message || e).slice(0, 300)]]; }
   const rejected = mock.log.filter((r) => r.kind === "rejected").length;
-  c.push(["the strict mock rejected no request (one leading system message only)", rejected === 0, `${rejected} rejected`]);
-  console.log(`\n== ${mode}: ${((Date.now() - t0) / 1000).toFixed(1)} s, ${mock.log.length} model requests, ${rejected} rejected by the strict mock, transcript ${path.join(ctx.dir, "transcript.md")}`);
+  if (strict) c.push(["the strict mock rejected no request (one leading system message only)", rejected === 0, `${rejected} rejected`]);
+  console.log(`\n== ${mode}: ${((Date.now() - t0) / 1000).toFixed(1)} s, ${mock.log.length} model requests${strict ? `, strict mock: ${rejected} rejected` : ""}, transcript ${path.join(ctx.dir, "transcript.md")}`);
   for (const [name, ok, detail] of c) { console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : "\n        got: " + detail}`); if (!ok) failed++; }
 }
 console.log(failed ? `\n${failed} check(s) failed` : "\nall checks passed");

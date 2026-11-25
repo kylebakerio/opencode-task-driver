@@ -93,3 +93,53 @@ export function decideEnforce(body) {
   if (lastCall === "bash" && n("bash") === 2) return call("todowrite", todos("completed", "completed", "completed"));
   return say("All three problems are fixed.");
 }
+
+// focus mode (0.3.0): the same three problems, but each task after the first is worked in a fresh conversation. The
+// scripted model reads the task context in the system prompt and only the messages it is shown:
+//   planning block            -> file_tasks
+//   task 1                    -> read config.txt (the read tool: the file map credits it to task 1) -> bash (fix)
+//                                -> task_note (9000 prompt tokens: opencode compacts, still in task 1)
+//                                -> finish_task with a handoff                         [boundary: task 2 starts fresh]
+//   task 2, first request     -> bash (partial; 9000 prompt tokens: opencode compacts inside task 2, after the boundary)
+//   task 2 afterwards         -> stops with text, every time it is asked (two follow-ups, then it is set aside)
+//   task 3 (the follow-up)    -> bash (fix) -> finish_task with a handoff of "none"   [boundary: the final pass]
+//   all closed                -> bash (run the checks) -> final text
+export const FOCUS_HANDOFF_1 = "config.txt now reads `limit = 10`; `cat config.txt` shows it. Nothing else changed.";
+// edge (decideFocus(..., { edge: true })): no compaction inside task 1; instead the step that calls finish_task(1)
+// reports 9000 prompt tokens, so opencode compacts right at the boundary, before task 2's first request.
+export function decideFocus(body, sys, { edge = false } = {}) {
+  const msgs = (body.messages || []).filter((m) => m.role !== "system");
+  const last = msgs[msgs.length - 1] || {};
+  let lastCall = null;
+  if (last.role === "tool") {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (m.role === "assistant" && m.tool_calls && m.tool_calls.length) { lastCall = m.tool_calls[m.tool_calls.length - 1].function.name; break; }
+    }
+  }
+  const lastText = last.role === "user" ? textOf(last.content) : "";
+  const cur = (sys.match(/The current task is task (\d+) of (\d+)/) || [])[1];
+  const closed = /The tasks, all now closed:/.test(sys);
+  const wd = ((sys.match(/Working directory: (\S+)/) || [])[1] || "").trim();
+  if (/<task_planning>/.test(sys)) return call("file_tasks", { tasks: TASKS });
+  if (cur === "1") {
+    if (lastCall === "file_tasks") return call("read", { filePath: `${wd}/config.txt` });
+    if (lastCall === "read") return call("bash", { command: "printf 'limit = 10\\n' > config.txt && cat config.txt", description: "Set the request limit" });
+    if (lastCall === "bash") return call("task_note", { id: 1, text: "Root cause: config.txt had limit = 5. Changed it to limit = 10; cat shows the new line." }, { ptok: edge ? 1000 : 9000 });
+    return call("finish_task", { id: 1, handoff: FOCUS_HANDOFF_1 }, { ptok: edge ? 9000 : 1000 });
+  }
+  if (cur === "2") {
+    if (last.role === "user" && /^We are now on task 2 of 3/.test(lastText) && !/What did we do so far/.test(lastText)) return call("bash", { command: "printf 'ttl = ?\\n' > cache.txt", description: "Start on cache expiry" }, { ptok: edge ? 1000 : 9000 });
+    if (edge && !msgs.some((m) => m.role === "assistant" && m.tool_calls)) return call("bash", { command: "printf 'ttl = ?\\n' > cache.txt", description: "Start on cache expiry" });
+    return say("I started on the cache expiry but I am not sure what the right fix is, so I will stop here for now.");
+  }
+  if (cur === "3") {
+    if (last.role === "user") return call("bash", { command: "printf 'title: Home\\n' > page.txt && cat page.txt", description: "Add the page title" });
+    if (lastCall === "bash") return call("finish_task", { id: 3, handoff: "none" });
+  }
+  if (closed) {
+    if (last.role === "user" && /^All tasks are closed/.test(lastText)) return call("bash", { command: "grep -q 'limit = 10' config.txt && grep -q 'title: Home' page.txt && echo ALL-CHECKS-PASS", description: "Run the checks" });
+    return say("The checks pass. Tasks 1 and 3 are fixed; the cache expiry (task 2) is still open.");
+  }
+  return say("Nothing left to do.");
+}
